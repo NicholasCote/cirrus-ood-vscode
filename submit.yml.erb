@@ -287,9 +287,25 @@ script:
       # session is proxied through /rnode/, which strips its own prefix before
       # forwarding, and code-server emits relative roots. Nothing in the pod
       # needs to know the node name or NodePort it was assigned.
+      # No double quotes in the command below, and that is load-bearing rather
+      # than a style choice.
+      #
+      # ood_core re-emits every element of this array into its own pod.yml.erb
+      # as `- "<the element>"`. A double quote inside the element therefore
+      # closes that YAML string early and the whole manifest fails to parse:
+      #   error converting YAML to JSON: did not find expected key
+      # This is the same hazard the Jupyter app's `Q=$(printf '\\047')` dance
+      # exists to work around -- it builds a single quote at runtime precisely
+      # so the literal never appears here.
+      #
+      # Nothing needs quoting in the first place: create_passwd builds the
+      # password from [a-zA-Z0-9] only, so it cannot contain a space or a shell
+      # metacharacter, and $PASSWORD expands to exactly one word. If it were
+      # ever empty the line still lands as `password=`, which launch.sh reports
+      # as a missing password rather than silently accepting.
       - name: "add-passwd-to-cfg"
         image: "<%= utility_img %>"
         command:
           - "/bin/bash"
           - "-c"
-          - 'source /bin/passwd_from_secret; /bin/add_line_to_configmap "password=${PASSWORD}" csenv'
+          - "source /bin/passwd_from_secret; /bin/add_line_to_configmap password=$PASSWORD csenv"

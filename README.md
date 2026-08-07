@@ -119,6 +119,23 @@ before they reach any YAML. The same applies to GECOS, which is free text from
 the site user database and would otherwise be able to inject a `/etc/passwd`
 line.
 
+The same constraint binds anything *this app* writes into a `command:` array,
+not just user input. ood_core re-emits each element as `- "<element>"`, so a
+literal double quote in a command closes the YAML string early and the whole
+manifest dies at submit time with:
+
+```
+error converting YAML to JSON: yaml: did not find expected key
+```
+
+That is what the Jupyter app's `Q=$(printf '\047')` incantation is for — it
+builds a quote at runtime so the literal never appears in the template. This app
+sidesteps it by needing no quoting at all: the only interpolated value is the
+password, which `create_passwd` builds from `[a-zA-Z0-9]` and which therefore
+always expands to exactly one shell word. **Anything added to a command array
+later must keep that property** — put it in `launch.sh` instead, where it lives
+inside a block scalar and quoting is free.
+
 ## Files
 
 | File | Purpose |
