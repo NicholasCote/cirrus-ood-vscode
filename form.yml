@@ -1,0 +1,59 @@
+---
+cluster: "cirrus"
+
+form:
+  - custom_image
+  - working_dir
+  - cpu
+  - memory
+  - wall_time
+
+attributes:
+  custom_image:
+    widget: text_field
+    label: "Container image"
+    value: "hub.k8s.ucar.edu/cirrus-jhub/jhub-cpu-nb:0.1.5"
+    help: |
+      Any image that contains a `code-server` executable and is reachable from
+      the Cirrus cluster. The default is the Cirrus JupyterHub base image, which
+      ships code-server alongside the `cirrus-base` and `r-4.4` conda
+      environments.
+
+      Note that most Jupyter images do **not** include code-server — it is a
+      separate install, not part of the Jupyter Docker Stacks. If you point this
+      at an image without it, the session will fail immediately and the log will
+      list the paths that were searched.
+    required: true
+  working_dir:
+    widget: text_field
+    label: "Working directory"
+    value: ""
+    help: |
+      Absolute path to the folder VS Code opens. Leave blank for your home
+      directory. Only your home directory is mounted into the session, so this
+      should be a path underneath it.
+    required: false
+  cpu:
+    widget: number_field
+    label: "CPUs"
+    min: 1
+    max: 8
+    value: 2
+    step: 1
+    required: true
+  memory:
+    widget: number_field
+    label: "Memory (GB)"
+    min: 1
+    max: 32
+    value: 8
+    step: 1
+    required: true
+  wall_time:
+    widget: number_field
+    label: "Wall time (hours)"
+    min: 1
+    max: 24
+    value: 4
+    step: 1
+    required: true

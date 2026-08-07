@@ -1,0 +1,10 @@
+---
+name: VS Code (CIRRUS)
+category: Interactive Apps
+subcategory: Servers
+role: batch_connect
+description: |
+  This app launches a VS Code session, served by [code-server], in the Cirrus
+  Kubernetes cluster with your home directory mounted.
+
+  [code-server]: https://github.com/coder/code-server
