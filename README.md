@@ -210,6 +210,78 @@ labelled, add the label under `native.node_selector` in `submit.yml.erb`:
       nvidia.com/gpu.present: "true"
 ```
 
+## Idle sessions end themselves after an hour
+
+An abandoned editor holds its CPU, memory, and GPU until something takes them
+back. **code-server has no idle shutdown of its own** — Jupyter has
+`shutdown_no_activity_timeout`, and there is no equivalent flag here — so the
+supervision lives in `launch.sh`.
+
+The signal code-server does expose is a heartbeat file, which it touches while a
+session is in use and stops touching when nothing is connected. A watchdog checks
+its age every 5 minutes and, past an hour, ends the session.
+
+Measured on 4.131.0, because the margin matters: during continuous activity the
+file is rewritten **at most once every 60 seconds**, so its age sawtooths between
+0 and ~62s; once idle, the age climbs without bound. A threshold anywhere near a
+minute would cull sessions that are actively in use. An hour is far clear of it.
+
+The heartbeat path is derived from `$XDG_DATA_HOME`, the way code-server derives
+it — *not* from `--user-data-dir`. Those coincide by default but diverge in the
+unwritable-home fallback above, which repoints `XDG_DATA_HOME`.
+
+Three details that are easy to get wrong:
+
+- **The cull exits 0.** `restart_policy` is `OnFailure`, so a nonzero exit
+  restarts the container and the session comes straight back — the pod would
+  cycle forever and the GPU would never be released. Exiting 0 leaves the pod
+  `Completed`. A genuine crash still exits nonzero and still gets its restart.
+- **code-server is no longer `exec`'d.** `launch.sh` stays PID 1 so it can
+  supervise. That means pod deletion sends `SIGTERM` to the shell, not to
+  code-server, so the script traps it and forwards it — otherwise ending a
+  session from the dashboard would leave the editor to be `SIGKILL`ed when the
+  grace period expired.
+- **A session nobody ever opens is still reclaimed.** Until the heartbeat file
+  exists the watchdog falls back to the session start time, so a mis-launched
+  session does not live out its full wall time.
+
+When it fires, it says so in the session log, since "my session disappeared" is
+otherwise an unanswerable support question:
+
+```
+launch.sh: no activity for 3612s (limit 3600s).
+launch.sh: ending this session so it stops holding its CPU, memory, and GPU.
+launch.sh: relaunch from OnDemand when you need it; your files, settings, and
+           extensions are in your home directory.
+```
+
+### The hard ceiling, and why wall time is not on the form
+
+`max_session_hours` in `submit.yml.erb` (12h) covers the one case idle culling
+structurally cannot: a tab left open in the foreground keeps the heartbeat fresh
+forever, however long nobody actually touches it. It reaches the pod as
+
+```yaml
+metadata:
+  annotations:
+    pod.kubernetes.io/lifetime: 12h00m00s
+```
+
+**Kubernetes ignores that annotation.** It does something only if
+[OSC/job-pod-reaper](https://github.com/OSC/job-pod-reaper) is deployed to watch
+for it — enforced if so, inert if not. The reaper matches pods carrying a `job`
+label, which ood_core already stamps on every pod.
+
+This used to be a **Wall time (hours)** form field, and it was asking users to
+answer an HPC scheduling question that does not apply here: Kubernetes has no job
+time limit, OnDemand never displays the value (the adapter reports elapsed
+`wallclock_time` but no `wallclock_limit`), and without the reaper it did nothing
+at all. Fixing it in the template keeps the backstop and drops the question.
+
+Do not let it fall back to the form. The field is gone, so a `wall_time.to_i`
+would be `0` and render a `00h00m00s` lifetime — which a reaper would honour
+instantly, killing every session the moment it started.
+
 ## Logging
 
 code-server runs at `--log info`. Debug was useful while the app was new but is
@@ -273,7 +345,7 @@ inside a block scalar and quoting is free.
 | File | Purpose |
 | --- | --- |
 | `manifest.yml` | App name, category, and description shown in OnDemand |
-| `form.yml` | Launch form (working directory, CPUs, memory, GPU, wall time) |
+| `form.yml` | Launch form (working directory, CPUs, memory, GPU) |
 | `submit.yml.erb` | Pod spec, NFS mount, ConfigMap (incl. `launch.sh`), init containers |
 | `view.html.erb` | Connect button; posts the session password to `/rnode/.../login` |
 | `info.md.erb` | Session card body; flags a GPU session |
@@ -316,6 +388,19 @@ one, `/etc/group` free of duplicate or malformed entries with no LDAP-range GID
 leaked, `/etc/passwd` lines all 7 fields with no duplicate UID, and no double
 quote in any command element. Both manifests pass
 `kubectl create --dry-run=client`.
+
+The fixed wall time was checked by rendering with **no `wall_time` in the form
+context at all**, so any lingering reference would raise rather than silently
+pick up a stale value; the lifetime annotation still comes out `12h00m00s`.
+
+The idle watchdog was exercised against live containers with the threshold cut to
+90s (anything under ~62s collides with the heartbeat's own write interval):
+
+| Case | Result |
+| --- | --- |
+| Left idle | Culled at 99s, **exit 0**, reason logged |
+| Kept busy across the same window | Still running, still serving, **0 false culls** |
+| `SIGTERM` (pod deletion) | **Exit 0 in 1s** — trap forwarded it, no grace-period kill |
 
 `launch.sh` was then run against a real `codercom/code-server` container to
 confirm: the password wait blocks the port and releases ~2s after the value

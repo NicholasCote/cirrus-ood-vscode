@@ -6,7 +6,6 @@ form:
   - cpu
   - memory
   - gpus
-  - wall_time
 
 attributes:
   working_dir:
@@ -58,11 +57,3 @@ attributes:
       install of PyTorch or TensorFlow works — those wheels bundle their own CUDA
       runtime and only need the driver, which the node injects. `nvidia-smi` is
       injected too and will see the card either way.
-  wall_time:
-    widget: number_field
-    label: "Wall time (hours)"
-    min: 1
-    max: 24
-    value: 4
-    step: 1
-    required: true

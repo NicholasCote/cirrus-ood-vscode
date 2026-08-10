@@ -2,6 +2,25 @@
   utility_img = "docker.io/ohiosupercomputer/ood-k8s-utils:latest"
   user = OodSupport::User.new
 
+  # How long a session may sit idle before it ends itself, and how often that is
+  # checked. One place to change both; see the watchdog in launch.sh below.
+  idle_timeout = 3600
+  idle_check_interval = 300
+
+  # Hard ceiling on a session, and the backstop for the one case idle culling
+  # structurally cannot catch: a tab left open in the foreground keeps the
+  # heartbeat fresh forever, however long nobody actually touches it.
+  #
+  # Must not be left to a form field. This used to be "Wall time (hours)" on the
+  # form, and if that value went missing `wall_time.to_i` would be 0 and render a
+  # 00h00m00s lifetime -- which a reaper would honour instantly, killing every
+  # session the moment it started.
+  #
+  # Note this only becomes a pod.kubernetes.io/lifetime annotation. Kubernetes
+  # ignores it; it means something only if OSC/job-pod-reaper is deployed to
+  # watch for it. Enforced if so, inert if not, harmless either way.
+  max_session_hours = 12
+
   # The editor image is fixed. Which container VS Code runs in is not a decision
   # a user opening an editor should have to make, and getting it wrong produces a
   # session that dies instantly -- code-server is a separate install, so most
@@ -59,7 +78,7 @@
 -%>
 ---
 script:
-  wall_time: "<%= wall_time.to_i * 3600 %>"
+  wall_time: "<%= max_session_hours * 3600 %>"
   # Requested only when the user asked for one. ood_core renders this into the
   # pod's resource limits AND requests as
   #
@@ -269,17 +288,34 @@ script:
             # without anyone having to exec into the pod.
             echo "launch.sh: code-server=${CS} workdir=${WORKDIR} data=${DATA_DIR}"
 
-            # --log info, not debug. Debug was useful while the app was new but
-            # is noise now that it works: it logs every HTTP request and
-            # websocket frame, which on an editor session is continuous. The
-            # launch.sh lines above are what triage actually starts from, and
-            # they are unconditional.
+            # --- 5. Idle culling -----------------------------------------------
             #
-            # Taken from $LOG_LEVEL when set, so debug can be turned back on by
-            # adding LOG_LEVEL to the container env above rather than editing and
-            # redeploying this script. The default lives here, in the shell, so
-            # it holds whether or not that variable exists.
-            exec "$CS" \
+            # code-server has no idle shutdown of its own. Jupyter does
+            # (shutdown_no_activity_timeout), which is how the Jupyter app ends
+            # abandoned sessions; there is no equivalent flag here, so the
+            # supervision has to live in this script.
+            #
+            # The signal it does expose is a heartbeat file, which it touches
+            # while a session is in use and stops touching when nothing is
+            # connected. Measured on 4.131.0: during continuous activity the file
+            # is rewritten at most once every 60s, so its age sawtooths between 0
+            # and ~62s; once idle, the age climbs without bound. An hour is
+            # therefore far clear of any false positive.
+            #
+            # Path derived the way code-server derives it -- from XDG, NOT from
+            # --user-data-dir. Those coincide by default, but not in the
+            # unwritable-home fallback above, which repoints XDG_DATA_HOME.
+            HEARTBEAT="${XDG_DATA_HOME:-$HOME/.local/share}/code-server/heartbeat"
+            IDLE_TIMEOUT=<%= idle_timeout %>
+            IDLE_CHECK=<%= idle_check_interval %>
+            CULLED=/tmp/code-server-idle-culled
+            rm -f "$CULLED"
+            STARTED="$(date +%s)"
+
+            # Not exec'd, unlike before: this shell stays as PID 1 so it can
+            # supervise code-server and outlive its exit long enough to decide
+            # what status to report. See the trap and the exit handling below.
+            "$CS" \
               --auth password \
               --bind-addr "0.0.0.0:${PORT}" \
               --user-data-dir "$DATA_DIR" \
@@ -288,7 +324,50 @@ script:
               --disable-update-check \
               --ignore-last-opened \
               --log "${LOG_LEVEL:-info}" \
-              "$WORKDIR"
+              "$WORKDIR" &
+            CS_PID=$!
+
+            (
+              while sleep "$IDLE_CHECK"; do
+                kill -0 "$CS_PID" 2>/dev/null || exit 0
+                # Falls back to this session's start time until the heartbeat
+                # exists, so a session nobody ever opens is still reclaimed
+                # rather than living out its full wall time.
+                BEAT="$(stat -c %Y "$HEARTBEAT" 2>/dev/null || echo "$STARTED")"
+                IDLE=$(( $(date +%s) - BEAT ))
+                if [ "$IDLE" -ge "$IDLE_TIMEOUT" ]; then
+                  echo "launch.sh: no activity for ${IDLE}s (limit ${IDLE_TIMEOUT}s)." >&2
+                  echo "launch.sh: ending this session so it stops holding its CPU, memory, and GPU." >&2
+                  echo "launch.sh: relaunch from OnDemand when you need it; your files, settings, and extensions are in your home directory." >&2
+                  : > "$CULLED"
+                  kill -TERM "$CS_PID" 2>/dev/null
+                  exit 0
+                fi
+              done
+            ) &
+
+            # Pod deletion now sends SIGTERM to this shell rather than to
+            # code-server, since this shell is PID 1. Forward it, so ending a
+            # session from the OnDemand dashboard shuts the editor down instead
+            # of leaving it to be SIGKILLed when the grace period expires.
+            trap 'kill -TERM "$CS_PID" 2>/dev/null; exit 0' TERM INT
+
+            wait "$CS_PID"
+            RC=$?
+
+            # Exit 0 after a cull. restart_policy is OnFailure, so a nonzero exit
+            # restarts the container and the session comes straight back -- which
+            # for an idle cull would mean never releasing anything, the pod
+            # cycling forever, and the GPU never returned. Exiting 0 leaves the
+            # pod Completed.
+            #
+            # A genuine crash still exits nonzero and still gets its restart;
+            # that is the behaviour this had before and is worth keeping.
+            if [ -f "$CULLED" ]; then
+              echo "launch.sh: session ended by the idle timeout (exit 0 so the pod completes rather than restarting)."
+              exit 0
+            fi
+            exit "$RC"
         # Seeded with a comment so the key exists in the ConfigMap for
         # add_line_to_configmap to read back and append to. launch.sh greps for
         # '^password=', so this line never matches.
