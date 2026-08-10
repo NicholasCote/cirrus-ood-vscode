@@ -55,6 +55,23 @@
 ---
 script:
   wall_time: "<%= wall_time.to_i * 3600 %>"
+  # Requested only when the user asked for one. ood_core renders this into the
+  # pod's resource limits AND requests as
+  #
+  #   nvidia.com/gpu: <n>
+  #
+  # (the key comes from native.gpu_type, which defaults to nvidia.com/gpu), and
+  # it guards the field with `unless script.gpus_per_node.nil?` -- a nil check,
+  # not a zero check. Emitting 0 would therefore still put the resource key in
+  # the spec, so the ERB has to skip the line rather than zero it; omitting it
+  # keeps a CPU-only session's pod byte-identical to what this app produced
+  # before GPUs were an option.
+  #
+  # to_i is load-bearing, not decoration: this value is interpolated unquoted,
+  # so anything that is not a plain integer could restructure the YAML.
+<%- if gpus.to_i > 0 -%>
+  gpus_per_node: <%= gpus.to_i %>
+<%- end -%>
   native:
     container:
       name: "code-server"
@@ -280,16 +297,67 @@ script:
             root:x:0:0:root:/root:/bin/bash
             <%= user.name %>:x:<%= user.uid %>:<%= user.group.id %>:<%= gecos %>:<%= user.home %>:/bin/bash
             nobody:x:65534:65534:nobody:/nonexistent:/usr/sbin/nologin
+            <%- unless user.uid == 1000 -%>
+            coder:x:1000:1000:default container user:/home/coder:/bin/bash
+            <%- end -%>
           mount_path: "/etc/passwd"
           sub_path: "passwd"
-        # Same treatment for the primary group, so `id` and `ls -l` render a
-        # group name instead of a bare number. Supplemental groups stay numeric;
-        # naming them is not worth regenerating this file for.
+        # Groups, seeded from this host's own group database.
+        #
+        # A GID with no name is not merely untidy: `groups` prints
+        #
+        #   groups: cannot find name for group ID 39
+        #
+        # into every terminal the user opens, and they have no way to tell that
+        # from a real problem. The case that shows up in practice is a GPU
+        # session, where the runtime attaches the group owning /dev/nvidia* so
+        # the container can open the device. That group is doing its job -- it is
+        # what lets nvidia-smi see the card. It just has no name here, because
+        # mounting this file at all hides the names the image shipped.
+        #
+        # The names cannot be hardcoded, and they cannot be read from the image,
+        # which is not pulled anywhere at submit time. But they do not need to be
+        # either: the supplementary GIDs a container ends up with are assigned by
+        # the node, not the image, so the node's numbering is the one that
+        # matters, and this host shares it. So copy the local system groups
+        # verbatim rather than guessing at any of them.
+        #
+        # Only GID < 1000, i.e. the system range, which is where injected device
+        # groups live. Everything above it is user and LDAP territory: unbounded,
+        # irrelevant here, and not ours to publish into a container. Reading the
+        # file directly rather than via Etc.group is what keeps that promise --
+        # Etc.group walks all of NSS, LDAP included.
         - filename: "group"
           data: |
             root:x:0:
             <%= user.group.name %>:x:<%= user.group.id %>:<%= user.name %>
+<%-
+  # Never let a group lookup break submission; an unnamed GID is a blemish, a
+  # failed launch is not.
+  seen_gids  = [0, user.group.id]
+  seen_names = ["root", user.group.name]
+  host_groups = begin
+                  File.readlines("/etc/group")
+                rescue StandardError
+                  []
+                end
+  host_groups.each do |line|
+    name, _passwd, gid, _members = line.chomp.split(":", 4)
+    next if name.nil? || gid.nil? || gid !~ /\A\d+\z/
+    gid = gid.to_i
+    next if gid >= 1000
+    next if seen_gids.include?(gid) || seen_names.include?(name)
+    seen_gids << gid
+    seen_names << name
+-%>
+            <%= name %>:x:<%= gid %>:
+<%- end -%>
+            <%- unless seen_gids.include?(1000) || seen_names.include?("coder") -%>
+            coder:x:1000:
+            <%- end -%>
+            <%- unless seen_gids.include?(65534) || seen_names.include?("nogroup") -%>
             nogroup:x:65534:
+            <%- end -%>
           mount_path: "/etc/group"
           sub_path: "group"
     init_containers:

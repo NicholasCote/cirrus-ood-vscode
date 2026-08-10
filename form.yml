@@ -5,6 +5,7 @@ form:
   - working_dir
   - cpu
   - memory
+  - gpus
   - wall_time
 
 attributes:
@@ -33,6 +34,30 @@ attributes:
     value: 8
     step: 1
     required: true
+  gpus:
+    widget: check_box
+    # A check_box renders its label inline next to the box rather than above the
+    # field, so it does not match the other inputs. `header` is rendered as
+    # markdown above any widget, which puts the field name where the eye
+    # expects it. Needs OnDemand >= 4.1.0; older versions ignore it, in which
+    # case make this a select with Yes/No options instead.
+    header: "**GPUs**"
+    label: "Request an NVIDIA GPU"
+    unchecked_value: 0
+    checked_value: 1
+    # NOT required. On a checkbox, `required` means "must be checked" -- the
+    # browser refuses to submit the form while the box is empty, which would
+    # make every CPU-only session impossible to launch.
+    required: false
+    help: |
+      Check the box to request one NVIDIA GPU (`nvidia.com/gpu`); leave it clear
+      for a CPU-only session.
+
+      The editor image is a blank slate and ships no CUDA toolkit, so bring your
+      own GPU-enabled environment from your home directory. A conda or pip
+      install of PyTorch or TensorFlow works — those wheels bundle their own CUDA
+      runtime and only need the driver, which the node injects. `nvidia-smi` is
+      injected too and will see the card either way.
   wall_time:
     widget: number_field
     label: "Wall time (hours)"

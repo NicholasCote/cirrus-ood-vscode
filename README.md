@@ -81,6 +81,25 @@ entry: a login shell of `/bin/tcsh` is common here and almost never present in a
 container image, and a shell that does not exist breaks terminals just as
 thoroughly as no passwd entry at all.
 
+`/etc/group` is seeded from **this host's** system range (GID < 1000) rather than
+hand-written. Mounting the file at all hides the names the image shipped, and an
+unnamed GID is not merely untidy — `groups` prints
+
+```
+groups: cannot find name for group ID 39
+```
+
+into every terminal, and the user has no way to tell that from a real fault. The
+case that shows up in practice is a GPU session, where the runtime attaches the
+group owning `/dev/nvidia*` so the container can open the device. That group is
+doing its job; it just has no name once this file is mounted. The names can't be
+hardcoded and can't be read from the image (not pulled anywhere at submit time),
+but they don't need to be: supplementary GIDs are assigned by the **node**, not
+the image, and this host shares the node's numbering. Only the system range is
+copied — above 1000 is user and LDAP territory, and not ours to publish into a
+container. The file is read directly rather than through `Etc.group`, which would
+walk all of NSS, LDAP included.
+
 ## The image is fixed
 
 There is no image field on the form. Which container VS Code runs in is not a
@@ -114,6 +133,65 @@ constant changes.
 purpose: swapping the constant is the intended way to change environments, and
 the probe makes doing so fail with a message naming the paths it searched rather
 than a bare `executable file not found` from the container runtime.
+
+## GPUs
+
+The form's **GPUs** checkbox sets `gpus_per_node`, which ood_core renders into the
+pod's resource limits *and* requests as `nvidia.com/gpu: 1`. The key comes from
+`native.gpu_type`, which defaults to `nvidia.com/gpu`; set it in `submit.yml.erb`
+if the cluster advertises GPUs under a different name.
+
+Leaving the box clear omits the line entirely rather than emitting
+`nvidia.com/gpu: 0`. ood_core guards the field with
+`unless script.gpus_per_node.nil?` — a nil check, not a zero check — so the ERB
+has to skip the key, not zero it. Verified: the rendered CPU and GPU pod
+manifests differ by exactly the two `nvidia.com/gpu` lines and nothing else.
+
+### The image has no CUDA toolkit
+
+Requesting a GPU does not make the editor image able to use one. The pinned image
+is a blank slate, so **bring your own GPU-enabled environment from your home
+directory.** That works better than it sounds: the node's device plugin injects
+the driver and `nvidia-smi`, and conda- or pip-installed PyTorch and TensorFlow
+wheels bundle their own CUDA runtime, so they need only the driver. `nvidia-smi`
+will see the card regardless of what is installed.
+
+If sessions should instead come with CUDA preinstalled, point `editor_img` at a
+CUDA-based image that also carries code-server. The Cirrus JupyterHub GPU images
+qualify: `cirrus-jhub-images` installs code-server in its `base` stage, and
+`gpu-nb`, `tf-nb`, and `torch-nb` all derive from it, so they carry it too —
+
+```
+hub.k8s.ucar.edu/cirrus-jhub/jhub-gpu-nb:<tag>
+hub.k8s.ucar.edu/cirrus-jhub/jhub-torch-nb:<tag>
+hub.k8s.ucar.edu/cirrus-jhub/jhub-tf-nb:<tag>
+```
+
+Those are multi-GB images, which is the trade for not asking the user to build an
+environment. Note they are built for Jupyter and their `code-server` lands in
+`/usr/bin` via the `code-server.dev` installer, which `launch.sh` already probes
+for first.
+
+### If a GPU session sits in Pending
+
+**ood_core's pod template emits `nodeSelector` but has no `tolerations` support at
+all.** If the GPU nodes carry a taint — `nvidia.com/gpu=present:NoSchedule` is a
+common one — this app cannot schedule onto them, and no change to
+`submit.yml.erb` will fix it, because there is no field to set. Check with:
+
+```bash
+kubectl get nodes -o custom-columns=\
+'NODE:.metadata.name,GPU:.status.allocatable.nvidia\.com/gpu,TAINTS:.spec.taints'
+```
+
+If the GPU nodes are tainted, the options are to remove the taint, admit these
+pods with a mutating webhook, or carry a patched pod template. If they are merely
+labelled, add the label under `native.node_selector` in `submit.yml.erb`:
+
+```yaml
+    node_selector:
+      nvidia.com/gpu.present: "true"
+```
 
 ## Persistence
 
@@ -163,7 +241,7 @@ inside a block scalar and quoting is free.
 | File | Purpose |
 | --- | --- |
 | `manifest.yml` | App name, category, and description shown in OnDemand |
-| `form.yml` | Launch form (working directory, CPUs, memory, wall time) |
+| `form.yml` | Launch form (working directory, CPUs, memory, GPU, wall time) |
 | `submit.yml.erb` | Pod spec, NFS mount, ConfigMap (incl. `launch.sh`), init containers |
 | `view.html.erb` | Connect button; posts the session password to `/rnode/.../login` |
 | `template/` | `batch_connect` template directory |
@@ -178,8 +256,8 @@ repo's **HTTPS** git URL. App files live at the repo root so OnDemand finds
 
 - **Not yet run on Cirrus.** Everything below was verified locally (see next
   section); the pod itself has not been submitted through OnDemand.
-- No GPU option. `gpus_per_node` is supported by ood_core but the resource name
-  and node availability on Cirrus have not been confirmed here.
+- GPU scheduling is untested on Cirrus. The manifest is correct, but whether the
+  GPU nodes are reachable without `tolerations` is unverified — see above.
 - The image is not mirrored into `hub.k8s.ucar.edu`, so first pull comes from
   Docker Hub (~1 GB).
 - Only the home directory is mounted, matching the Jupyter apps.
@@ -191,8 +269,16 @@ repo's **HTTPS** git URL. App files live at the repo root so OnDemand finds
 Rendered `submit.yml.erb` through ERB with a stubbed `OodSupport::User` and
 checked the result parses as YAML with the fields ood_core expects, that the
 command survives `Shellwords.split`, and that no two ConfigMap files declare the
-same `mountPath` (which the API server rejects outright). Six injection attempts
-against the two free-text fields and against GECOS were rejected.
+same `mountPath` (which the API server rejects outright). Injection attempts
+against the working-directory field and against GECOS were rejected.
+
+Both the CPU and GPU paths were rendered all the way through ood_core's own
+`pod.yml.erb` and checked: `nvidia.com/gpu` present in limits and requests when
+requested and absent otherwise, `gpus` of `0`/`''`/`nil`/`'off'` never requesting
+one, `/etc/group` free of duplicate or malformed entries with no LDAP-range GID
+leaked, `/etc/passwd` lines all 7 fields with no duplicate UID, and no double
+quote in any command element. Both manifests pass
+`kubectl create --dry-run=client`.
 
 `launch.sh` was then run against a real `codercom/code-server` container to
 confirm: the password wait blocks the port and releases ~2s after the value
