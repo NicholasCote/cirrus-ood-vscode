@@ -16,10 +16,15 @@
   #   digest at time of pinning:
   #   sha256:3623e6362abdec6258472882b06fdeec9d6ce2ad3fda316b3c5d7ed092b89add
   #
-  # Pulled from Docker Hub, as the ood-k8s-utils init containers already are.
-  # Worth mirroring into hub.k8s.ucar.edu eventually -- a local copy pulls faster
-  # and does not depend on Docker Hub rate limits -- at which point only this
-  # constant changes.
+  # Left as a docker.io reference on purpose. hub.k8s.ucar.edu proxies external
+  # registries, so the cluster pulls this through Harbor and caches it: the first
+  # pull of a new tag is slow, every one after it is fast and served locally. The
+  # reference does not need rewriting to get that -- so do not "optimise" this
+  # into a hub.k8s.ucar.edu path, which would only hardcode a detail of the
+  # registry layout into the app.
+  #
+  # It does mean bumping the version below makes the next launch slow once, which
+  # is worth knowing before doing it in front of a user.
   editor_img = "docker.io/codercom/code-server:4.131.0"
 
   # Everything below that touches form input is validated here, before it
@@ -264,6 +269,16 @@ script:
             # without anyone having to exec into the pod.
             echo "launch.sh: code-server=${CS} workdir=${WORKDIR} data=${DATA_DIR}"
 
+            # --log info, not debug. Debug was useful while the app was new but
+            # is noise now that it works: it logs every HTTP request and
+            # websocket frame, which on an editor session is continuous. The
+            # launch.sh lines above are what triage actually starts from, and
+            # they are unconditional.
+            #
+            # Taken from $LOG_LEVEL when set, so debug can be turned back on by
+            # adding LOG_LEVEL to the container env above rather than editing and
+            # redeploying this script. The default lives here, in the shell, so
+            # it holds whether or not that variable exists.
             exec "$CS" \
               --auth password \
               --bind-addr "0.0.0.0:${PORT}" \
@@ -272,7 +287,7 @@ script:
               --disable-telemetry \
               --disable-update-check \
               --ignore-last-opened \
-              --log debug \
+              --log "${LOG_LEVEL:-info}" \
               "$WORKDIR"
         # Seeded with a comment so the key exists in the ConfigMap for
         # add_line_to_configmap to read back and append to. launch.sh greps for

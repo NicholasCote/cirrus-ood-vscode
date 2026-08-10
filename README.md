@@ -122,10 +122,16 @@ point of control, and the only requirement on a replacement is a `code-server`
 executable and a POSIX shell.
 
 Pinned to an explicit version rather than `:latest` so a session that worked
-yesterday works today. Pulled from Docker Hub, as the `ood-k8s-utils` init
-containers already are; worth mirroring into `hub.k8s.ucar.edu` eventually for
-pull speed and to drop the Docker Hub dependency, at which point only that one
-constant changes.
+yesterday works today.
+
+The reference is left pointing at `docker.io` deliberately. `hub.k8s.ucar.edu`
+proxies external registries, so the cluster pulls this through Harbor and caches
+it — the first pull of a new tag is slow, and every one after it is fast and
+served locally. Nothing has to be mirrored by hand and the reference does not
+need rewriting into a `hub.k8s.ucar.edu` path, which would only bake a detail of
+the registry layout into the app. The practical consequence is that **bumping the
+version makes the next launch slow exactly once**, which is worth knowing before
+doing it in front of someone.
 
 `launch.sh` still probes `/usr/bin`, `/usr/local/bin`,
 `/usr/lib/code-server/bin`, `/opt/code-server/bin`, `$HOME/.local/bin`, and
@@ -204,6 +210,21 @@ labelled, add the label under `native.node_selector` in `submit.yml.erb`:
       nvidia.com/gpu.present: "true"
 ```
 
+## Logging
+
+code-server runs at `--log info`. Debug was useful while the app was new but is
+noise now that it works — it logs every HTTP request and websocket frame, which
+on an editor session is continuous.
+
+The level comes from `$LOG_LEVEL` when that is set, so debug can be turned back
+on by adding `LOG_LEVEL: "debug"` to the container `env` in `submit.yml.erb`
+rather than editing the launch script. The default lives in the shell, so it
+holds whether or not the variable exists.
+
+What triage actually starts from is the `launch.sh:` lines, which are
+unconditional at any level: the binary that was chosen, the folder opened, the
+state directory in use, and any warning about an unwritable home.
+
 ## Persistence
 
 `--user-data-dir` and `--extensions-dir` point at `$HOME/.local/share/code-server`
@@ -278,11 +299,7 @@ driver, not the CUDA toolkit.
 
 ## Not yet done
 
-- The image is not mirrored into `hub.k8s.ucar.edu`, so first pull comes from
-  Docker Hub (~1 GB).
 - Only the home directory is mounted, matching the Jupyter apps.
-- `--log debug` is on deliberately while the app is new; worth dialing back once
-  it has some mileage.
 
 ## What was verified locally
 
