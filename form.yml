@@ -2,28 +2,12 @@
 cluster: "cirrus"
 
 form:
-  - custom_image
   - working_dir
   - cpu
   - memory
   - wall_time
 
 attributes:
-  custom_image:
-    widget: text_field
-    label: "Container image"
-    value: "hub.k8s.ucar.edu/cirrus-jhub/jhub-cpu-nb:0.1.5"
-    help: |
-      Any image that contains a `code-server` executable and is reachable from
-      the Cirrus cluster. The default is the Cirrus JupyterHub base image, which
-      ships code-server alongside the `cirrus-base` and `r-4.4` conda
-      environments.
-
-      Note that most Jupyter images do **not** include code-server — it is a
-      separate install, not part of the Jupyter Docker Stacks. If you point this
-      at an image without it, the session will fail immediately and the log will
-      list the paths that were searched.
-    required: true
   working_dir:
     widget: text_field
     label: "Working directory"

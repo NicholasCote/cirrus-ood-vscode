@@ -69,7 +69,7 @@ pass `--config`.
 ## Running as the real user
 
 The pod's `securityContext` is the user's own UID and GID, which no stock image
-knows about — a Jupyter-derived image's `/etc/passwd` was built around `jovyan`
+knows about — the code-server image's `/etc/passwd` was built around `coder`
 (UID 1000). `/etc/passwd` and `/etc/group` are therefore supplied from the
 ConfigMap with an entry for the real user, mounted with `subPath` so they replace
 those two files and nothing else in `/etc`. Without it, `getpwuid()` fails and
@@ -81,17 +81,39 @@ entry: a login shell of `/bin/tcsh` is common here and almost never present in a
 container image, and a shell that does not exist breaks terminals just as
 thoroughly as no passwd entry at all.
 
-## Choosing an image
+## The image is fixed
 
-The image needs a `code-server` executable and must be reachable from the Cirrus
-cluster. **Most Jupyter images do not have one** — code-server is a separate
-install, not part of the Jupyter Docker Stacks. The Cirrus JupyterHub base image
-does, via the `code-server.dev` installer, which is why it is the default here.
+There is no image field on the form. Which container VS Code runs in is not a
+decision a user opening an editor should have to make, and getting it wrong
+produces a session that dies on startup — code-server is a separate install, so
+most images, including nearly every Jupyter image, simply do not have it.
 
-`launch.sh` probes `/usr/bin`, `/usr/local/bin`, `/usr/lib/code-server/bin`,
-`/opt/code-server/bin`, `$HOME/.local/bin`, and then `$PATH`, and if it finds
-nothing it says so and lists where it looked — rather than failing with the bare
-`executable file not found` that naming a path directly would produce.
+The app runs upstream's own image, pinned:
+
+```
+docker.io/codercom/code-server:4.131.0
+```
+
+A blank slate — Debian 13, glibc 2.41, `code-server` at `/usr/bin/code-server`,
+plus `bash`, `git`, `curl`, and `nano`. Deliberately **no** Python, compilers, or
+scientific stack: users bring their own toolchain from their home directory,
+which is mounted. If a session needs a preinstalled environment instead, change
+the `editor_img` constant at the top of `submit.yml.erb` — that is the single
+point of control, and the only requirement on a replacement is a `code-server`
+executable and a POSIX shell.
+
+Pinned to an explicit version rather than `:latest` so a session that worked
+yesterday works today. Pulled from Docker Hub, as the `ood-k8s-utils` init
+containers already are; worth mirroring into `hub.k8s.ucar.edu` eventually for
+pull speed and to drop the Docker Hub dependency, at which point only that one
+constant changes.
+
+`launch.sh` still probes `/usr/bin`, `/usr/local/bin`,
+`/usr/lib/code-server/bin`, `/opt/code-server/bin`, `$HOME/.local/bin`, and
+`$PATH` for the binary. That is redundant for the pinned image and kept on
+purpose: swapping the constant is the intended way to change environments, and
+the probe makes doing so fail with a message naming the paths it searched rather
+than a bare `executable file not found` from the container runtime.
 
 ## Persistence
 
@@ -110,14 +132,14 @@ background process and floods the log with uncaught `EACCES`.
 ## Form input is validated at the door
 
 `submit.yml.erb` output is parsed by ood_core and re-rendered through *its*
-`pod.yml.erb`, which interpolates values either bare (the image field) or inside
-plain double quotes (env values). That template is in another gem and cannot be
-fixed from here, so a form value containing `": "`, a double quote, `#`, or a
-newline could restructure the generated Pod manifest. Both free-text fields are
-therefore checked against a strict pattern and rejected with an explanatory error
-before they reach any YAML. The same applies to GECOS, which is free text from
-the site user database and would otherwise be able to inject a `/etc/passwd`
-line.
+`pod.yml.erb`, which interpolates values into bare double quotes. That template
+is in another gem and cannot be fixed from here, so a form value containing
+`": "`, a double quote, `#`, or a newline could restructure the generated Pod
+manifest. The working-directory field — now the only free-text input, since
+fixing the image removed the other one — is therefore checked against a strict
+pattern and rejected with an explanatory error before it reaches any YAML. The
+same applies to GECOS, which is free text from the site user database and would
+otherwise be able to inject an `/etc/passwd` line.
 
 The same constraint binds anything *this app* writes into a `command:` array,
 not just user input. ood_core re-emits each element as `- "<element>"`, so a
@@ -141,7 +163,7 @@ inside a block scalar and quoting is free.
 | File | Purpose |
 | --- | --- |
 | `manifest.yml` | App name, category, and description shown in OnDemand |
-| `form.yml` | Launch form (image, working directory, CPUs, memory, wall time) |
+| `form.yml` | Launch form (working directory, CPUs, memory, wall time) |
 | `submit.yml.erb` | Pod spec, NFS mount, ConfigMap (incl. `launch.sh`), init containers |
 | `view.html.erb` | Connect button; posts the session password to `/rnode/.../login` |
 | `template/` | `batch_connect` template directory |
@@ -158,6 +180,8 @@ repo's **HTTPS** git URL. App files live at the repo root so OnDemand finds
   section); the pod itself has not been submitted through OnDemand.
 - No GPU option. `gpus_per_node` is supported by ood_core but the resource name
   and node availability on Cirrus have not been confirmed here.
+- The image is not mirrored into `hub.k8s.ucar.edu`, so first pull comes from
+  Docker Hub (~1 GB).
 - Only the home directory is mounted, matching the Jupyter apps.
 - `--log debug` is on deliberately while the app is new; worth dialing back once
   it has some mileage.
