@@ -136,6 +136,14 @@ than a bare `executable file not found` from the container runtime.
 
 ## GPUs
 
+A GPU session is flagged on the session card by `info.md.erb`. The card
+deliberately does *not* report the image the way the Jupyter apps do — that is
+fixed here rather than chosen on the form, so it would be the same constant on
+every session. The GPU request is the one launch choice that changes what the
+session can do, and nothing else on the card reveals it. Nothing is printed for
+CPU-only sessions, matching the Jupyter apps so the two read the same way side
+by side.
+
 The form's **GPUs** checkbox sets `gpus_per_node`, which ood_core renders into the
 pod's resource limits *and* requests as `nvidia.com/gpu: 1`. The key comes from
 `native.gpu_type`, which defaults to `nvidia.com/gpu`; set it in `submit.yml.erb`
@@ -171,6 +179,9 @@ Those are multi-GB images, which is the trade for not asking the user to build a
 environment. Note they are built for Jupyter and their `code-server` lands in
 `/usr/bin` via the `code-server.dev` installer, which `launch.sh` already probes
 for first.
+
+Confirmed working on Cirrus against an NVIDIA A10 — see
+[Confirmed on Cirrus](#confirmed-on-cirrus).
 
 ### If a GPU session sits in Pending
 
@@ -244,6 +255,7 @@ inside a block scalar and quoting is free.
 | `form.yml` | Launch form (working directory, CPUs, memory, GPU, wall time) |
 | `submit.yml.erb` | Pod spec, NFS mount, ConfigMap (incl. `launch.sh`), init containers |
 | `view.html.erb` | Connect button; posts the session password to `/rnode/.../login` |
+| `info.md.erb` | Session card body; flags a GPU session |
 | `template/` | `batch_connect` template directory |
 
 ## Deploy as a dev app
@@ -252,12 +264,20 @@ inside a block scalar and quoting is free.
 repo's **HTTPS** git URL. App files live at the repo root so OnDemand finds
 `manifest.yml`.
 
+## Confirmed on Cirrus
+
+A GPU session launched through OnDemand and came up working: the terminal
+prompt reads `<user>@code-server-<id>` — so the `/etc/passwd` mount resolved the
+real user rather than leaving an `I have no name!` prompt — and `nvidia-smi`
+reported an **NVIDIA A10**, driver 580.159.04, 23 GB. So the GPU nodes are
+reachable without `tolerations` on this cluster, and the concern below about
+`Pending` did not materialise.
+
+`nvcc` is absent, as expected and as documented above: the node injects the
+driver, not the CUDA toolkit.
+
 ## Not yet done
 
-- **Not yet run on Cirrus.** Everything below was verified locally (see next
-  section); the pod itself has not been submitted through OnDemand.
-- GPU scheduling is untested on Cirrus. The manifest is correct, but whether the
-  GPU nodes are reachable without `tolerations` is unverified — see above.
 - The image is not mirrored into `hub.k8s.ucar.edu`, so first pull comes from
   Docker Hub (~1 GB).
 - Only the home directory is mounted, matching the Jupyter apps.

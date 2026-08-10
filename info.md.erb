@@ -1,0 +1,31 @@
+<%#
+  Rendered into the session card body by the dashboard.
+
+  Unlike the Jupyter apps, this deliberately does NOT report the image. That is
+  fixed by submit.yml.erb rather than chosen on the form, so it is identical on
+  every session of this app and printing it would just be a constant taking up
+  the card.
+
+  The GPU request is the one launch choice that changes what the session can
+  actually do, and nothing else on the card reveals it -- the dashboard shows
+  host, times, and session id, and the app title is fixed by manifest.yml.
+
+  Shown only when a GPU was asked for. A "GPU: no" line on every CPU-only
+  session is noise, and its absence is not ambiguous once users know the card
+  calls out GPUs and stays quiet otherwise -- which matches the Jupyter apps,
+  so the two read the same way side by side.
+
+  ERB binding here is the BatchConnect::Session itself, which is where
+  user_context comes from: the launch form values, read back from
+  user_defined_context.json in the session's staged directory. Keys are form
+  attribute ids, so this must track form.yml's `gpus`.
+
+  to_i rather than a truthiness test: the checkbox arrives as the string "1" or
+  "0" (form.yml's checked_value/unchecked_value), and "0" is truthy in Ruby. It
+  also copes with the key being absent on sessions staged before this field
+  existed, and makes the value safe to interpolate without escaping.
+-%>
+<%- gpus = user_context["gpus"].to_i -%>
+<%- if gpus > 0 -%>
+**GPU<%= 's' if gpus > 1 %>:** <%= gpus %> &times; `nvidia.com/gpu`
+<%- end -%>
