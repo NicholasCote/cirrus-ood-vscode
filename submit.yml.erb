@@ -65,6 +65,11 @@ script:
         host: "gladedm1.ucar.edu"
         path: "/gpfs/csfs1/collections"
         destination_path: /glade/collections
+      - type: nfs
+        name: work
+        host: "gladedm1.ucar.edu"
+        path: "/gpfs/csfs1/work"
+        destination_path: /glade/work
     configmap:
       files:
         - filename: "launch.sh"
