@@ -55,7 +55,16 @@ script:
         host: "gladedm1.ucar.edu"
         path: "/gpfs/csfs1"
         destination_path: /glade/campaign
-        read_only: true
+      - type: nfs
+        name: gdex
+        host: "gladedm1.ucar.edu"
+        path: "/gpfs/csfs1/collections/gdex"
+        destination_path: /gdex
+      - type: nfs
+        name: collections
+        host: "gladedm1.ucar.edu"
+        path: "/gpfs/csfs1/collections"
+        destination_path: /glade/collections
     configmap:
       files:
         - filename: "launch.sh"
