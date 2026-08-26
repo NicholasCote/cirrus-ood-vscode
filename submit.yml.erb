@@ -2,67 +2,13 @@
   utility_img = "docker.io/ohiosupercomputer/ood-k8s-utils:latest"
   user = OodSupport::User.new
 
-  # How long a session may sit idle before it ends itself, and how often that is
-  # checked. One place to change both; see the watchdog in launch.sh below.
   idle_timeout = 3600
   idle_check_interval = 300
 
-  # Hard ceiling on a session, and the backstop for the one case idle culling
-  # structurally cannot catch: a tab left open in the foreground keeps the
-  # heartbeat fresh forever, however long nobody actually touches it.
-  #
-  # Must not be left to a form field. This used to be "Wall time (hours)" on the
-  # form, and if that value went missing `wall_time.to_i` would be 0 and render a
-  # 00h00m00s lifetime -- which a reaper would honour instantly, killing every
-  # session the moment it started.
-  #
-  # Note this only becomes a pod.kubernetes.io/lifetime annotation. Kubernetes
-  # ignores it; it means something only if OSC/job-pod-reaper is deployed to
-  # watch for it. Enforced if so, inert if not, harmless either way.
   max_session_hours = 12
 
-  # The editor image is fixed. Which container VS Code runs in is not a decision
-  # a user opening an editor should have to make, and getting it wrong produces a
-  # session that dies instantly -- code-server is a separate install, so most
-  # images (including nearly every Jupyter image) simply do not have it.
-  #
-  # This is upstream's own image: Debian 13, glibc 2.41, code-server at
-  # /usr/bin/code-server, with bash, git, curl, and nano and nothing else. A
-  # blank slate. Users bring their own toolchain from their home directory.
-  #
-  # Pinned to an explicit version, not :latest, so a session that worked
-  # yesterday works today and the log line naming the version means something.
-  #   digest at time of pinning:
-  #   sha256:3623e6362abdec6258472882b06fdeec9d6ce2ad3fda316b3c5d7ed092b89add
-  #
-  # Left as a docker.io reference on purpose. hub.k8s.ucar.edu proxies external
-  # registries, so the cluster pulls this through Harbor and caches it: the first
-  # pull of a new tag is slow, every one after it is fast and served locally. The
-  # reference does not need rewriting to get that -- so do not "optimise" this
-  # into a hub.k8s.ucar.edu path, which would only hardcode a detail of the
-  # registry layout into the app.
-  #
-  # It does mean bumping the version below makes the next launch slow once, which
-  # is worth knowing before doing it in front of a user.
   editor_img = "docker.io/codercom/code-server:4.131.0"
 
-  # Everything below that touches form input is validated here, before it
-  # reaches any YAML.
-  #
-  # This app renders submit.yml.erb; ood_core then parses the result and renders
-  # its own pod.yml.erb from it, and that template interpolates values into bare
-  # double quotes. We do not control that template, so a form value containing
-  # ": ", a double quote, "#", or a newline can restructure the generated Pod
-  # manifest. Rather than try to out-escape a template in another gem, reject
-  # anything that isn't the shape we expect at the door.
-  #
-  # Fixing the image removed the other half of this surface -- it used to be a
-  # free-text field feeding the one spot ood_core emits unquoted.
-
-  # Blank means "open my home directory". launch.sh re-checks that the path is
-  # actually a directory once it is inside the container and falls back to $HOME
-  # if it is not -- the OnDemand host and the pod do not necessarily agree about
-  # what exists, so the check that matters has to happen there.
   workdir = working_dir.to_s.strip
   workdir = user.home if workdir.empty?
   unless workdir.match?(%r{\A/[A-Za-z0-9 ._\-/]{0,1023}\z})
@@ -71,28 +17,11 @@
           "'.', '_', '-', and '/'."
   end
 
-  # GECOS is the one field here that comes from the site's user database rather
-  # than the form, and it is free text. A colon in it would shift every field
-  # after it in the passwd line below; a newline would add a whole entry.
   gecos = user.gecos.to_s.gsub(/[:\r\n]/, " ").strip
 -%>
 ---
 script:
   wall_time: "<%= max_session_hours * 3600 %>"
-  # Requested only when the user asked for one. ood_core renders this into the
-  # pod's resource limits AND requests as
-  #
-  #   nvidia.com/gpu: <n>
-  #
-  # (the key comes from native.gpu_type, which defaults to nvidia.com/gpu), and
-  # it guards the field with `unless script.gpus_per_node.nil?` -- a nil check,
-  # not a zero check. Emitting 0 would therefore still put the resource key in
-  # the spec, so the ERB has to skip the line rather than zero it; omitting it
-  # keeps a CPU-only session's pod byte-identical to what this app produced
-  # before GPUs were an option.
-  #
-  # to_i is load-bearing, not decoration: this value is interpolated unquoted,
-  # so anything that is not a plain integer could restructure the YAML.
 <%- if gpus.to_i > 0 -%>
   gpus_per_node: <%= gpus.to_i %>
 <%- end -%>
@@ -100,50 +29,17 @@ script:
     container:
       name: "code-server"
       image: "<%= editor_img %>"
-      # Launched through /ood/launch.sh rather than by naming code-server
-      # directly, for two reasons:
-      #
-      #   1. The session password does not exist yet at this point. It is
-      #      generated by an init container and has to be read at runtime --
-      #      see the configmap and init_containers sections below.
-      #   2. There is real work to do before the editor starts -- resolve the
-      #      folder to open, set up the state directory, degrade sanely if the
-      #      home mount is broken -- and none of it can be expressed in a
-      #      `command` array.
-      #
-      # launch.sh also probes for the code-server binary rather than hardcoding
-      # /usr/bin/code-server. That is redundant for the pinned image, and kept
-      # deliberately: swapping the image constant above is the intended way to
-      # change environments, and the probe means doing so fails with a message
-      # naming the paths it searched instead of a bare "executable file not
-      # found" from the container runtime.
-      #
-      # Every token is space-free on purpose: ood_core runs this through
-      # Shellwords.split into the pod's `command` array, so this is not a shell
-      # and a quoted `sh -c '...'` payload would not survive the trip.
-      # Invoking via /bin/sh also avoids depending on the configmap file being
-      # executable, which projected volumes do not guarantee.
       command: "/bin/sh /ood/launch.sh"
       restart_policy: "OnFailure"
-      # Start in the user's home rather than wherever the image's WORKDIR
-      # points, which for Jupyter-derived images is a throwaway /home/jovyan
-      # that vanishes with the pod.
       working_dir: "<%= user.home %>"
       env:
         HOME: "<%= user.home %>"
         USER: "<%= user.name %>"
-        # VS Code's integrated terminal launches $SHELL. Jupyter-derived images
-        # have bash; the user's real login shell (often tcsh here) usually is
-        # not present, so do not copy it from their passwd entry.
         SHELL: "/bin/bash"
         CODE_SERVER_WORKDIR: "<%= workdir %>"
       port: 8080
       cpu: "<%= cpu %>"
       memory: "<%= memory %>Gi"
-      # ood_core's default startup probe allows 2s + 5 x 5s = 27s for the port
-      # to open, and that is not enough here: launch.sh waits for the init
-      # container's password to land in the configmap before it binds anything,
-      # and the pod would be killed mid-wait. Allow five minutes.
       startup_probe:
         initial_delay_seconds: 5
         failure_threshold: 60
@@ -154,15 +50,13 @@ script:
         host: "gladenfs.hpc.ucar.edu"
         path: "/gpfs/u/home/<%= user.name %>"
         destination_path: "<%= user.home %>"
+      - type: nfs
+        name: campaign
+        host: "gladedm1.ucar.edu"
+        path: "/gpfs/csfs1"
+        destination_path: /glade/campaign
     configmap:
       files:
-        # One mount_path for the whole configmap. ood_core emits a volumeMount
-        # per file that declares one, and each of those mounts the entire
-        # configmap volume -- so two files naming the same mount_path produce
-        # duplicate mountPaths and the API server rejects the pod outright:
-        #   spec.containers[0].volumeMounts[1].mountPath: "/ood": must be unique
-        # Files below with no mount_path are still projected into /ood; they
-        # just do not add a second mount of the same volume.
         - filename: "launch.sh"
           mount_path: "/ood"
           data: |
@@ -173,21 +67,6 @@ script:
             CSENV=/ood/csenv
             PORT=8080
 
-            # --- 1. Wait for the session password ------------------------------
-            #
-            # The password is generated by the init-secret container, stored in a
-            # k8s Secret, and copied into this configmap by add-passwd-to-cfg.
-            # OnDemand reads the same Secret to build the Connect button, so both
-            # ends agree without the password ever being rendered into an app
-            # template.
-            #
-            # The wait is what makes that race-free. Volumes are mounted before
-            # init containers run, so this file is already projected -- empty --
-            # by the time the init container edits the underlying ConfigMap.
-            # Kubelet watches ConfigMaps and re-projects within a second or two,
-            # but "usually fast enough" is not a guarantee, and losing that race
-            # silently would produce a session whose Connect button is rejected
-            # with no clue why.
             i=0
             while [ "$i" -lt 120 ]; do
               if [ -f "$CSENV" ] && grep -q '^password=' "$CSENV"; then
@@ -205,18 +84,8 @@ script:
               cat "$CSENV" >&2 2>/dev/null
               exit 1
             fi
-            # code-server reads $PASSWORD for --auth=password. This takes
-            # precedence over any ~/.config/code-server/config.yaml that a
-            # previous session left in the user's home -- which matters, because
-            # code-server writes that file itself on first run with a random
-            # password of its own.
             export PASSWORD
 
-            # --- 2. Find code-server -------------------------------------------
-            #
-            # /usr/bin is where the convenience installer at code-server.dev puts
-            # the symlink, and is what the Cirrus JupyterHub images have. The
-            # rest cover tarball and standalone installs.
             for c in /usr/bin/code-server \
                      /usr/local/bin/code-server \
                      /usr/lib/code-server/bin/code-server \
@@ -227,7 +96,6 @@ script:
                 break
               fi
             done
-            # Last resort: whatever is on PATH. Covers layouts we have not seen.
             [ -n "${CS:-}" ] || CS="$(command -v code-server 2>/dev/null)"
 
             if [ -z "${CS:-}" ]; then
@@ -240,7 +108,6 @@ script:
               exit 127
             fi
 
-            # --- 3. Working directory ------------------------------------------
             WORKDIR="${CODE_SERVER_WORKDIR:-$HOME}"
             if [ ! -d "$WORKDIR" ]; then
               echo "launch.sh: '$WORKDIR' is not a directory in this session;" >&2
@@ -249,19 +116,6 @@ script:
             fi
             cd "$WORKDIR" || cd "$HOME" || exit 1
 
-            # --- 4. Persistent state -------------------------------------------
-            #
-            # On the NFS home on purpose: installed extensions, settings, and
-            # window layout then survive the pod, which is the whole point of a
-            # session you relaunch every day.
-            #
-            # Checked rather than assumed. If this directory cannot be created,
-            # code-server does not degrade gracefully -- it throws repeated
-            # uncaught EACCES exceptions from a background process and the
-            # session half-works in a way that is genuinely hard to read from
-            # the logs. Falling back to container-local storage keeps the editor
-            # usable (and the terminal available to debug with), but it is a
-            # real loss of persistence, so say so unmistakably.
             DATA_DIR="$HOME/.local/share/code-server"
             if ! mkdir -p "$DATA_DIR/extensions" 2>/dev/null; then
               echo "launch.sh: WARNING cannot create $DATA_DIR" >&2
@@ -283,28 +137,8 @@ script:
               mkdir -p "$XDG_DATA_HOME" "$XDG_CONFIG_HOME" "$XDG_CACHE_HOME" || exit 1
             fi
 
-            # Say what was chosen. When a session misbehaves the first question
-            # is which binary it actually ran, and kubectl logs should answer it
-            # without anyone having to exec into the pod.
             echo "launch.sh: code-server=${CS} workdir=${WORKDIR} data=${DATA_DIR}"
 
-            # --- 5. Idle culling -----------------------------------------------
-            #
-            # code-server has no idle shutdown of its own. Jupyter does
-            # (shutdown_no_activity_timeout), which is how the Jupyter app ends
-            # abandoned sessions; there is no equivalent flag here, so the
-            # supervision has to live in this script.
-            #
-            # The signal it does expose is a heartbeat file, which it touches
-            # while a session is in use and stops touching when nothing is
-            # connected. Measured on 4.131.0: during continuous activity the file
-            # is rewritten at most once every 60s, so its age sawtooths between 0
-            # and ~62s; once idle, the age climbs without bound. An hour is
-            # therefore far clear of any false positive.
-            #
-            # Path derived the way code-server derives it -- from XDG, NOT from
-            # --user-data-dir. Those coincide by default, but not in the
-            # unwritable-home fallback above, which repoints XDG_DATA_HOME.
             HEARTBEAT="${XDG_DATA_HOME:-$HOME/.local/share}/code-server/heartbeat"
             IDLE_TIMEOUT=<%= idle_timeout %>
             IDLE_CHECK=<%= idle_check_interval %>
@@ -312,9 +146,6 @@ script:
             rm -f "$CULLED"
             STARTED="$(date +%s)"
 
-            # Not exec'd, unlike before: this shell stays as PID 1 so it can
-            # supervise code-server and outlive its exit long enough to decide
-            # what status to report. See the trap and the exit handling below.
             "$CS" \
               --auth password \
               --bind-addr "0.0.0.0:${PORT}" \
@@ -346,46 +177,19 @@ script:
               done
             ) &
 
-            # Pod deletion now sends SIGTERM to this shell rather than to
-            # code-server, since this shell is PID 1. Forward it, so ending a
-            # session from the OnDemand dashboard shuts the editor down instead
-            # of leaving it to be SIGKILLed when the grace period expires.
             trap 'kill -TERM "$CS_PID" 2>/dev/null; exit 0' TERM INT
 
             wait "$CS_PID"
             RC=$?
 
-            # Exit 0 after a cull. restart_policy is OnFailure, so a nonzero exit
-            # restarts the container and the session comes straight back -- which
-            # for an idle cull would mean never releasing anything, the pod
-            # cycling forever, and the GPU never returned. Exiting 0 leaves the
-            # pod Completed.
-            #
-            # A genuine crash still exits nonzero and still gets its restart;
-            # that is the behaviour this had before and is worth keeping.
             if [ -f "$CULLED" ]; then
               echo "launch.sh: session ended by the idle timeout (exit 0 so the pod completes rather than restarting)."
               exit 0
             fi
             exit "$RC"
-        # Seeded with a comment so the key exists in the ConfigMap for
-        # add_line_to_configmap to read back and append to. launch.sh greps for
-        # '^password=', so this line never matches.
+
         - filename: "csenv"
           data: |
-            # session password is appended here by the add-passwd-to-cfg init container
-        # Give the UID we run as a name.
-        #
-        # The pod's securityContext is runAsUser: <the user's real UID>, but the
-        # image's /etc/passwd only knows the UID it was built with (1000/jovyan
-        # for Jupyter-derived images). Every getpwuid() lookup then fails, which
-        # surfaces as an "I have no name!" prompt in every VS Code terminal and,
-        # less visibly, as git and ssh tripping over a missing home and username.
-        #
-        # sub_path is what makes this safe: without it the configmap volume would
-        # mount over all of /etc and take the image's resolv.conf, ssl certs, and
-        # everything else with it. With it, k8s projects this single key over the
-        # single file.
         - filename: "passwd"
           data: |
             root:x:0:0:root:/root:/bin/bash
@@ -396,31 +200,6 @@ script:
             <%- end -%>
           mount_path: "/etc/passwd"
           sub_path: "passwd"
-        # Groups, seeded from this host's own group database.
-        #
-        # A GID with no name is not merely untidy: `groups` prints
-        #
-        #   groups: cannot find name for group ID 39
-        #
-        # into every terminal the user opens, and they have no way to tell that
-        # from a real problem. The case that shows up in practice is a GPU
-        # session, where the runtime attaches the group owning /dev/nvidia* so
-        # the container can open the device. That group is doing its job -- it is
-        # what lets nvidia-smi see the card. It just has no name here, because
-        # mounting this file at all hides the names the image shipped.
-        #
-        # The names cannot be hardcoded, and they cannot be read from the image,
-        # which is not pulled anywhere at submit time. But they do not need to be
-        # either: the supplementary GIDs a container ends up with are assigned by
-        # the node, not the image, so the node's numbering is the one that
-        # matters, and this host shares it. So copy the local system groups
-        # verbatim rather than guessing at any of them.
-        #
-        # Only GID < 1000, i.e. the system range, which is where injected device
-        # groups live. Everything above it is user and LDAP territory: unbounded,
-        # irrelevant here, and not ours to publish into a container. Reading the
-        # file directly rather than via Etc.group is what keeps that promise --
-        # Etc.group walks all of NSS, LDAP included.
         - filename: "group"
           data: |
             root:x:0:
@@ -455,37 +234,10 @@ script:
           mount_path: "/etc/group"
           sub_path: "group"
     init_containers:
-      # Generate a random password and store it in <pod>-secret. OnDemand's
-      # kubernetes adapter reads that Secret back and exposes every key in it to
-      # view.html.erb, which is where the `password` local there comes from.
       - name: "init-secret"
         image: "<%= utility_img %>"
         command:
           - "/bin/save_passwd_as_secret"
-      # Copy it into the configmap so the container itself can read it. The
-      # Secret is not mounted into the pod, and the main container has no
-      # kubectl or RBAC to fetch it.
-      #
-      # No init container computes a base URL here, unlike the Jupyter app: this
-      # session is proxied through /rnode/, which strips its own prefix before
-      # forwarding, and code-server emits relative roots. Nothing in the pod
-      # needs to know the node name or NodePort it was assigned.
-      # No double quotes in the command below, and that is load-bearing rather
-      # than a style choice.
-      #
-      # ood_core re-emits every element of this array into its own pod.yml.erb
-      # as `- "<the element>"`. A double quote inside the element therefore
-      # closes that YAML string early and the whole manifest fails to parse:
-      #   error converting YAML to JSON: did not find expected key
-      # This is the same hazard the Jupyter app's `Q=$(printf '\\047')` dance
-      # exists to work around -- it builds a single quote at runtime precisely
-      # so the literal never appears here.
-      #
-      # Nothing needs quoting in the first place: create_passwd builds the
-      # password from [a-zA-Z0-9] only, so it cannot contain a space or a shell
-      # metacharacter, and $PASSWORD expands to exactly one word. If it were
-      # ever empty the line still lands as `password=`, which launch.sh reports
-      # as a missing password rather than silently accepting.
       - name: "add-passwd-to-cfg"
         image: "<%= utility_img %>"
         command:

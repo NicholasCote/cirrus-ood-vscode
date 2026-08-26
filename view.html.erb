@@ -1,26 +1,3 @@
-<%#
-  Posts the session password to code-server's login endpoint and lands the user
-  in the editor already authenticated.
-
-  /rnode/, not /node/ -- this is the one structural difference from the Jupyter
-  apps and it is not interchangeable.
-
-  OnDemand ships two proxies. /node/HOST/PORT/... forwards the *full* path,
-  prefix included, so the backend has to be told what prefix it is living under
-  (that is what the Jupyter app's third init container computes, and what
-  c.ServerApp.base_url consumes). /rnode/HOST/PORT/... strips the prefix and
-  forwards only the remainder.
-
-  code-server has no base-path setting to compute. It emits relative roots and
-  assumes it is mounted at /, which is exactly what /rnode/ gives it. Pointed at
-  /node/ instead, it would receive requests for paths it does not serve and the
-  session would come up blank.
-
-  `password`, `host`, and `port` come from the connection info the kubernetes
-  adapter assembles: host and port from the pod's node and the service's
-  NodePort, and password from the <pod>-secret written by the init-secret
-  container -- the adapter exposes every key of that Secret here.
--%>
 <form action="/rnode/<%= host %>/<%= port %>/login?to=" method="post" target="_blank">
   <input type="hidden" name="password" value="<%= password %>">
   <button class="btn btn-primary" type="submit">
