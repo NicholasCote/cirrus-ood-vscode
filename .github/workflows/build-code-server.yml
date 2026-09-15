@@ -1,0 +1,189 @@
+name: Build code-server image
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "containers/code-server/**"
+      - ".github/workflows/build-code-server.yml"
+  workflow_dispatch:
+    inputs:
+      tag_suffix:
+        description: >-
+          Optional suffix for a same-day rebuild (e.g. "2" gives
+          4.131.0-20260915-2). Dated tags collide otherwise and the second
+          build silently overwrites the first.
+        required: false
+        type: string
+      skip_bump:
+        description: "Build and push, but do not commit the tag to submit.yml.erb"
+        required: false
+        type: boolean
+        default: false
+
+concurrency:
+  group: build-code-server
+  cancel-in-progress: false
+
+env:
+  REGISTRY: hub.k8s.ucar.edu
+  IMAGE: hub.k8s.ucar.edu/cirrus-ood/code-server
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write        # needed to commit the tag bump back to main
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+        with:
+          # Tag bump is committed from this checkout, so keep the token.
+          persist-credentials: true
+
+      - name: Derive image tag
+        id: meta
+        run: |
+          set -euo pipefail
+          # Single source of truth for the version is the Dockerfile's FROM
+          # line, so bumping the base is the only edit needed to roll the tag.
+          version="$(sed -n 's|^FROM docker\.io/codercom/code-server:\([^ ]*\)$|\1|p' \
+                     containers/code-server/Dockerfile)"
+          if [ -z "$version" ]; then
+            echo "::error file=containers/code-server/Dockerfile::Could not parse the code-server version from the FROM line. If the base image was changed, update the sed in this workflow to match."
+            exit 1
+          fi
+          tag="${version}-$(date -u +%Y%m%d)"
+          suffix="${{ inputs.tag_suffix }}"
+          if [ -n "$suffix" ]; then
+            tag="${tag}-${suffix}"
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "tag=$tag"         >> "$GITHUB_OUTPUT"
+          echo "ref=${IMAGE}:${tag}" >> "$GITHUB_OUTPUT"
+          echo "Building ${IMAGE}:${tag}"
+
+      - name: Warn on tag collision
+        env:
+          ROBOT_USER: ${{ secrets.HARBOR_USERNAME }}
+          ROBOT_TOKEN: ${{ secrets.HARBOR_TOKEN }}
+          TAG: ${{ steps.meta.outputs.tag }}
+        run: |
+          set -euo pipefail
+          # Dated tags are mutable by design here; say so loudly rather than
+          # overwriting a previously deployed image in silence.
+          code="$(curl -s -o /dev/null -w '%{http_code}' -u "${ROBOT_USER}:${ROBOT_TOKEN}" \
+            "https://${REGISTRY}/v2/cirrus-ood/code-server/manifests/${TAG}" \
+            -H 'Accept: application/vnd.oci.image.index.v1+json' \
+            -H 'Accept: application/vnd.docker.distribution.manifest.list.v2+json' || echo 000)"
+          if [ "$code" = "200" ]; then
+            echo "::warning::${IMAGE}:${TAG} already exists and will be OVERWRITTEN. Re-run with a tag_suffix (e.g. 2) to keep the existing image."
+          fi
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to Harbor
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ secrets.HARBOR_USERNAME }}
+          password: ${{ secrets.HARBOR_TOKEN }}
+
+      - name: Build
+        uses: docker/build-push-action@v6
+        with:
+          context: containers/code-server
+          platforms: linux/amd64
+          load: true
+          push: false
+          tags: ${{ steps.meta.outputs.ref }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Smoke test
+        env:
+          REF: ${{ steps.meta.outputs.ref }}
+          VERSION: ${{ steps.meta.outputs.version }}
+        run: |
+          set -euo pipefail
+          # Runs as an arbitrary high UID with a fabricated HOME, because that
+          # is what OOD does -- the pod is mapped to the real user's UID via a
+          # mounted /etc/passwd and is never 1000 or root at runtime.
+          docker run --rm --user 12345:6789 -e HOME=/tmp/fakehome \
+            --entrypoint /bin/bash "$REF" -c '
+              set -euo pipefail
+              mkdir -p "$HOME/.local/bin"
+              for b in code-server gcc gfortran cmake ninja clangd clang-format \
+                       gdb git git-lfs jq rg tmux unzip buildctl conda python3; do
+                command -v "$b" >/dev/null || { echo "MISSING: $b"; exit 1; }
+              done
+              [ "$(command -v python3)" = /usr/bin/python3 ] \
+                || { echo "system python3 is shadowed by conda"; exit 1; }
+              [ "${LANG:-}" = en_US.UTF-8 ] || { echo "LANG not set"; exit 1; }
+              # The PATH hook must fire in a non-login interactive shell, which
+              # is the only kind a code-server terminal ever opens.
+              bash -ic "case \":\$PATH:\" in *\":\$HOME/.local/bin:\"*) ;; *) echo \"~/.local/bin missing from PATH\"; exit 1;; esac"
+              # conda must NOT be auto-sourced: CONDA_SHLVL leaking from
+              # /etc/bash.bashrc silently suppresses user dotfiles.
+              bash -ic "[ -z \"\${CONDA_SHLVL:-}\" ]" \
+                || { echo "conda is being auto-sourced"; exit 1; }
+              echo "smoke test OK"
+            '
+          # Guard against a base bump that silently changes what users get.
+          # Note: `code-server --version` prints an info line ("Wrote default
+          # config file to ...") BEFORE the version, so take the first line that
+          # actually looks like a version rather than the first line.
+          raw="$(docker run --rm --entrypoint /usr/bin/code-server "$REF" --version 2>&1)"
+          got="$(grep -m1 -oE '^[0-9]+\.[0-9]+\.[0-9]+' <<<"$raw" || true)"
+          if [ "$got" != "$VERSION" ]; then
+            echo "code-server reports '${got:-<none>}', Dockerfile pins '$VERSION'"
+            echo "full output:"; echo "$raw"
+            exit 1
+          fi
+          echo "version check OK: $got"
+
+      - name: Push
+        run: docker push "${{ steps.meta.outputs.ref }}"
+
+      - name: Bump editor_img in submit.yml.erb
+        if: ${{ !inputs.skip_bump }}
+        env:
+          REF: ${{ steps.meta.outputs.ref }}
+        run: |
+          set -euo pipefail
+          python3 - "$REF" <<'PY'
+          import pathlib, re, sys
+          ref = sys.argv[1]
+          p = pathlib.Path("submit.yml.erb")
+          s = p.read_text()
+          new, n = re.subn(r'^(\s*editor_img\s*=\s*)".*"$',
+                           lambda m: f'{m.group(1)}"{ref}"', s, count=1, flags=re.M)
+          if n != 1:
+              sys.exit("could not find a single editor_img assignment in submit.yml.erb")
+          p.write_text(new)
+          PY
+          if git diff --quiet -- submit.yml.erb; then
+            echo "editor_img already at $REF; nothing to commit."
+            exit 0
+          fi
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add submit.yml.erb
+          # [skip ci] is belt-and-braces; the paths filter above is what actually
+          # prevents the loop.
+          git commit -m "Bump editor_img to ${REF#*/} [skip ci]"
+          git push origin HEAD:main
+
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo "### code-server image"
+            echo
+            echo '```'
+            echo "${{ steps.meta.outputs.ref }}"
+            echo '```'
+            echo
+            echo "First launch after this bump pulls through Harbor and is slow exactly once."
+          } >> "$GITHUB_STEP_SUMMARY"

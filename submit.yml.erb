@@ -7,7 +7,14 @@
 
   max_session_hours = 12
 
-  editor_img = "docker.io/codercom/code-server:4.131.0"
+  # Our own image (containers/code-server/Dockerfile): upstream code-server
+  # plus the toolchain users cannot install without root -- compilers, clangd,
+  # Miniforge at /opt/conda, and buildctl.
+  #
+  # This line is REWRITTEN BY CI. .github/workflows/build-code-server.yml
+  # builds the image, pushes it, and commits the new tag back here -- so edit
+  # the Dockerfile and let the workflow bump this, rather than hand-editing.
+  editor_img = "hub.k8s.ucar.edu/cirrus-ood/code-server:4.131.0-20260915"
 
   workdir = working_dir.to_s.strip
   workdir = user.home if workdir.empty?
@@ -37,6 +44,9 @@ script:
         USER: "<%= user.name %>"
         SHELL: "/bin/bash"
         CODE_SERVER_WORKDIR: "<%= workdir %>"
+        # buildctl ships in the image; the endpoint is site topology and stays
+        # here so the image itself carries none.
+        BUILDKIT_HOST: "tcp://buildkitd.arc-systems.svc:1234"
       port: 8080
       cpu: "<%= cpu %>"
       memory: "<%= memory %>Gi"
