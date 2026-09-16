@@ -4,7 +4,9 @@
 #
 # Inclusion rule: if a user cannot install it into their own home without root,
 # it belongs here. Anything a user can drop into ~/.local/bin themselves is
-# deliberately left out -- including kubectl and kubelogin.
+# deliberately left out -- including kubectl.
+#
+# kubelogin is the one documented exception to that (see its section below).
 #
 # This image runs under Open OnDemand, which maps the pod to the real user's
 # UID through a mounted /etc/passwd. Nothing here is root at runtime and users
@@ -27,6 +29,7 @@ SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 # rather than drifting with whatever is newest.
 ARG MINIFORGE_VERSION=26.7.2-0
 ARG BUILDKIT_VERSION=0.33.0
+ARG KUBELOGIN_VERSION=0.2.19
 
 # --- Toolchain (root required) ----------------------------------------------
 # Compilers and headers for the C++/Fortran users. clangd is the C/C++ language
@@ -34,8 +37,8 @@ ARG BUILDKIT_VERSION=0.33.0
 # Microsoft marketplace, so clangd is the only workable intellisense path here.
 #
 # curl, unzip, tar and xz-utils are load-bearing beyond their own use: they are
-# what make the "user installs it themselves" path actually work. Without unzip
-# a user cannot unpack kubelogin at all.
+# what make the "user installs it themselves" path actually work. unzip is also
+# what unpacks kubelogin below.
 RUN set -eux; \
     apt-get update; \
     DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
@@ -75,7 +78,7 @@ ENV LANG=en_US.UTF-8 \
 RUN set -eux; \
     printf '%s\n' \
       '' \
-      '# Per-user binaries (kubectl, kubelogin, krew, pipx, ...) live here.' \
+      '# Per-user binaries (kubectl, krew, pipx, ...) live here.' \
       'if [ -n "${HOME:-}" ]; then' \
       '    case ":$PATH:" in' \
       '        *":$HOME/.local/bin:"*) ;;' \
@@ -132,5 +135,30 @@ RUN set -eux; \
       "https://github.com/moby/buildkit/releases/download/v${BUILDKIT_VERSION}/buildkit-v${BUILDKIT_VERSION}.linux-${arch}.tar.gz"; \
     tar -xzf /tmp/buildkit.tar.gz -C /usr/local/bin --strip-components=1 bin/buildctl; \
     rm -f /tmp/buildkit.tar.gz
+
+# --- kubelogin --------------------------------------------------------------
+# A deliberate exception to the inclusion rule: a user CAN unpack this into
+# ~/.local/bin themselves, and the rule says it should stay out. It is here
+# because the rule loses on the facts.
+#
+# The cluster's kubeconfig uses a client-go credential plugin, so without
+# kubelogin on PATH every single kubectl call -- not just auth -- dies with
+# "executable kubelogin not found" and a wall of memcache.go errors. Every user
+# hits that on day one, on a cluster whose Harbor and API server are both
+# Entra ID backed. Shipping one pinned binary beats making everyone debug it.
+#
+# kubectl itself is still NOT here: it is a single static binary with no
+# unpacking step, which is exactly the case the inclusion rule is meant for.
+#
+# Ships as a zip (hence unzip in the apt list, which is load-bearing for this
+# very reason), and the archive's internal path uses linux_amd64/linux_arm64
+# with an underscore while the asset name uses linux-amd64 with a hyphen.
+RUN set -eux; \
+    arch="$(dpkg --print-architecture)"; \
+    curl -fsSLo /tmp/kubelogin.zip \
+      "https://github.com/Azure/kubelogin/releases/download/v${KUBELOGIN_VERSION}/kubelogin-linux-${arch}.zip"; \
+    unzip -j /tmp/kubelogin.zip "bin/linux_${arch}/kubelogin" -d /usr/local/bin; \
+    chmod 0755 /usr/local/bin/kubelogin; \
+    rm -f /tmp/kubelogin.zip
 
 USER 1000

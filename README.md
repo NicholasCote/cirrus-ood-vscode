@@ -210,27 +210,74 @@ labelled, add the label under `native.node_selector` in `submit.yml.erb`:
       nvidia.com/gpu.present: "true"
 ```
 
-## Idle sessions end themselves after an hour
+## Idle culling: two separate timeouts
 
 An abandoned editor holds its CPU, memory, and GPU until something takes them
 back. **code-server has no idle shutdown of its own** — Jupyter has
 `shutdown_no_activity_timeout`, and there is no equivalent flag here — so the
 supervision lives in `launch.sh`.
 
-The signal code-server does expose is a heartbeat file, which it touches while a
-session is in use and stops touching when nothing is connected. A watchdog checks
-its age every 5 minutes and, past an hour, ends the session.
+There are two culls, because there are two different ways a session goes unused:
 
-Measured on 4.131.0, because the margin matters: during continuous activity the
-file is rewritten **at most once every 60 seconds**, so its age sawtooths between
-0 and ~62s; once idle, the age climbs without bound. A threshold anywhere near a
-minute would cull sessions that are actively in use. An hour is far clear of it.
+| Setting | Meaning | Default |
+|---|---|---|
+| `disconnect_timeout` | idle time once the browser session is disconnected | 4h |
+| `connected_idle_timeout` | idle user time with a connected browser | 8h |
+| `idle_check_interval` | how often the watchdog looks — **not** a timeout | 5min |
 
-The heartbeat path is derived from `$XDG_DATA_HOME`, the way code-server derives
-it — *not* from `--user-data-dir`. Those coincide by default but diverge in the
-unwritable-home fallback above, which repoints `XDG_DATA_HOME`.
+The check interval is polling granularity only. Nothing is killed at 5 minutes;
+it just means a cull lands within 5 minutes of its actual threshold.
 
-Three details that are easy to get wrong:
+### Why the heartbeat is not an activity signal
+
+code-server exposes a heartbeat file, and it is tempting to read its age as "how
+long the user has been idle." It is not that. Read `out/node/heart.js` on
+4.131.0: `beat()` writes the file at most once per 60s, then arms a 60s timer
+whose callback re-beats **if `server.getConnections()` is non-zero**. So the
+chain sustains itself purely from an open socket, with no user involvement, and
+stops within ~60s of the last connection closing.
+
+Heartbeat age therefore measures **time disconnected**, not time idle. Verified
+by holding a socket open and watching the file: once connections hit zero the
+mtime froze and never advanced again.
+
+That has a consequence worth stating plainly: a tab left open in the foreground
+keeps the heartbeat fresh forever, so heartbeat age alone can never cull it. It
+also means a laptop going to sleep looks exactly like a closed tab — the TCP
+connections die, the heartbeat freezes, and the disconnect clock starts even
+though the tab is still sitting there and will look connected on wake. That is
+the usual explanation for "my session vanished while my browser was still open."
+
+### Why the second tier reads CPU, not the heartbeat
+
+For the connected-but-idle case the watchdog reads cumulative pod CPU from the
+cgroup (`/sys/fs/cgroup/cpu.stat`, `usage_usec`; cgroup v1 `cpuacct.usage` as a
+fallback). If the pod burns less than `busy_cpu_ms` per interval, the interval
+counts as idle.
+
+**Not** by summing `/proc/<pid>/stat`: `/proc` only shows processes that are
+still alive, so work that starts and finishes between two samples registers as
+zero. Measured — a `g++` compile that cost 30ms of cgroup CPU showed up as
+0 ticks in a `/proc` walk taken either side of it. The cgroup counter includes
+reaped children, which is the entire point.
+
+The threshold is calibrated, not guessed. Idle baseline for this image is
+~200ms of CPU per 5-minute interval (worst observed single minute: 120ms), so
+`busy_cpu_ms = 2000` sits about 3x clear of the noise floor.
+
+Two things follow from using CPU as the signal, both intended:
+
+- A long-running compile or training run **is** activity, and holds the session
+  open however long it runs, even with nobody watching.
+- Reading code in an open tab is **not** activity. That session is culled at
+  `connected_idle_timeout`. This is the case the old single-timeout design
+  could not reach at all.
+
+If the cgroup files are unreadable the second tier disables itself and logs that
+it has, rather than culling on a signal it cannot measure. The disconnect cull
+is unaffected.
+
+### Three details that are easy to get wrong
 
 - **The cull exits 0.** `restart_policy` is `OnFailure`, so a nonzero exit
   restarts the container and the session comes straight back — the pod would
@@ -245,11 +292,23 @@ Three details that are easy to get wrong:
   exists the watchdog falls back to the session start time, so a mis-launched
   session does not live out its full wall time.
 
-When it fires, it says so in the session log, since "my session disappeared" is
-otherwise an unanswerable support question:
+The heartbeat path is derived from `$XDG_DATA_HOME`, the way code-server derives
+it — *not* from `--user-data-dir`. Those coincide by default but diverge in the
+unwritable-home fallback above, which repoints `XDG_DATA_HOME`. Confirmed by
+running the image and locating the file code-server actually writes.
+
+Either cull says which one fired in the session log, since "my session
+disappeared" is otherwise an unanswerable support question:
 
 ```
-launch.sh: no activity for 3612s (limit 3600s).
+launch.sh: no browser connected for 14402s (limit 14400s).
+launch.sh: ending this session so it stops holding its CPU, memory, and GPU.
+launch.sh: relaunch from OnDemand when you need it; your files, settings, and
+           extensions are in your home directory.
+```
+
+```
+launch.sh: browser connected but the session used almost no CPU for 28803s (limit 28800s).
 launch.sh: ending this session so it stops holding its CPU, memory, and GPU.
 launch.sh: relaunch from OnDemand when you need it; your files, settings, and
            extensions are in your home directory.
@@ -257,9 +316,11 @@ launch.sh: relaunch from OnDemand when you need it; your files, settings, and
 
 ### The hard ceiling, and why wall time is not on the form
 
-`max_session_hours` in `submit.yml.erb` (12h) covers the one case idle culling
-structurally cannot: a tab left open in the foreground keeps the heartbeat fresh
-forever, however long nobody actually touches it. It reaches the pod as
+`max_session_hours` in `submit.yml.erb` (12h) is the backstop under both culls.
+It used to carry more weight: before `connected_idle_timeout` existed, a tab left
+open in the foreground kept the heartbeat fresh forever and wall time was the
+only thing that could ever reclaim it. That gap is now closed, so this is a true
+ceiling rather than the primary limit. It reaches the pod as
 
 ```yaml
 metadata:

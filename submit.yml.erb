@@ -2,8 +2,15 @@
   utility_img = "docker.io/ohiosupercomputer/ood-k8s-utils:latest"
   user = OodSupport::User.new
 
-  idle_timeout = 3600
-  idle_check_interval = 300
+  # Two separate culls. See the "Idle culling" section of the README.
+  connected_idle_timeout = 28800  # idle user time with a connected browser
+  disconnect_timeout     = 14400  # idle time once the browser session is disconnected
+  idle_check_interval    = 300    # how often the culler looks; NOT a timeout
+
+  # CPU used by the whole pod, per check interval, that counts as "the user is
+  # doing something". Measured idle baseline for this image is ~200ms per 5min
+  # (worst observed minute 120ms), so 2000ms is roughly 3x headroom.
+  busy_cpu_ms = 2000
 
   max_session_hours = 12
 
@@ -164,12 +171,37 @@ script:
 
             echo "launch.sh: code-server=${CS} workdir=${WORKDIR} data=${DATA_DIR}"
 
+            # code-server rewrites this file at most once a minute. Its liveness
+            # check is server.getConnections(), so the file keeps advancing as
+            # long as a browser holds a socket open and STOPS within ~60s of the
+            # last one closing. Staleness therefore measures time DISCONNECTED,
+            # not time idle -- a connected-but-unused tab beats forever.
             HEARTBEAT="${XDG_DATA_HOME:-$HOME/.local/share}/code-server/heartbeat"
-            IDLE_TIMEOUT=<%= idle_timeout %>
+            DISCONNECT_TIMEOUT=<%= disconnect_timeout %>
+            CONNECTED_IDLE_TIMEOUT=<%= connected_idle_timeout %>
             IDLE_CHECK=<%= idle_check_interval %>
+            BUSY_CPU_MS=<%= busy_cpu_ms %>
             CULLED=/tmp/code-server-idle-culled
             rm -f "$CULLED"
             STARTED="$(date +%s)"
+
+            # Cumulative CPU for the whole pod, in ms. Read from the cgroup, not
+            # by summing /proc/<pid>/stat: /proc only shows processes that are
+            # still alive, so a compile that starts and finishes between two
+            # samples registers as zero. The cgroup counter includes reaped
+            # children, which is the whole point.
+            cpu_ms() {
+              if [ -r /sys/fs/cgroup/cpu.stat ]; then
+                # cgroup v2
+                awk '/^usage_usec/ { print int($2 / 1000); found = 1 } END { if (!found) print "" }' \
+                  /sys/fs/cgroup/cpu.stat
+              elif [ -r /sys/fs/cgroup/cpuacct/cpuacct.usage ]; then
+                # cgroup v1, nanoseconds
+                awk '{ print int($1 / 1000000) }' /sys/fs/cgroup/cpuacct/cpuacct.usage
+              else
+                echo ""
+              fi
+            }
 
             "$CS" \
               --auth password \
@@ -184,15 +216,50 @@ script:
             CS_PID=$!
 
             (
+              PREV_CPU="$(cpu_ms)"
+              LAST_BUSY="$STARTED"
+              if [ -z "$PREV_CPU" ]; then
+                echo "launch.sh: no cgroup CPU accounting available; the connected-but-idle cull is disabled for this session (the disconnect cull still applies)." >&2
+              fi
+
               while sleep "$IDLE_CHECK"; do
                 kill -0 "$CS_PID" 2>/dev/null || exit 0
+                NOW="$(date +%s)"
+
+                # --- did the pod actually do anything this interval? ---
+                if [ -n "$PREV_CPU" ]; then
+                  CUR_CPU="$(cpu_ms)"
+                  if [ -n "$CUR_CPU" ]; then
+                    if [ "$((CUR_CPU - PREV_CPU))" -ge "$BUSY_CPU_MS" ]; then
+                      LAST_BUSY="$NOW"
+                    fi
+                    PREV_CPU="$CUR_CPU"
+                  fi
+                fi
+
+                # --- tier 1: browser disconnected ---
                 # Falls back to this session's start time until the heartbeat
                 # exists, so a session nobody ever opens is still reclaimed
                 # rather than living out its full wall time.
                 BEAT="$(stat -c %Y "$HEARTBEAT" 2>/dev/null || echo "$STARTED")"
-                IDLE=$(( $(date +%s) - BEAT ))
-                if [ "$IDLE" -ge "$IDLE_TIMEOUT" ]; then
-                  echo "launch.sh: no activity for ${IDLE}s (limit ${IDLE_TIMEOUT}s)." >&2
+                DISCONNECTED=$(( NOW - BEAT ))
+                if [ "$DISCONNECTED" -ge "$DISCONNECT_TIMEOUT" ]; then
+                  echo "launch.sh: no browser connected for ${DISCONNECTED}s (limit ${DISCONNECT_TIMEOUT}s)." >&2
+                  REASON="disconnected"
+                else
+                  REASON=""
+                fi
+
+                # --- tier 2: browser connected, but nothing is happening ---
+                if [ -z "$REASON" ] && [ -n "$PREV_CPU" ]; then
+                  IDLE=$(( NOW - LAST_BUSY ))
+                  if [ "$IDLE" -ge "$CONNECTED_IDLE_TIMEOUT" ]; then
+                    echo "launch.sh: browser connected but the session used almost no CPU for ${IDLE}s (limit ${CONNECTED_IDLE_TIMEOUT}s)." >&2
+                    REASON="idle"
+                  fi
+                fi
+
+                if [ -n "$REASON" ]; then
                   echo "launch.sh: ending this session so it stops holding its CPU, memory, and GPU." >&2
                   echo "launch.sh: relaunch from OnDemand when you need it; your files, settings, and extensions are in your home directory." >&2
                   : > "$CULLED"

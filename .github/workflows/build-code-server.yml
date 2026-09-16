@@ -115,11 +115,13 @@ jobs:
               set -euo pipefail
               mkdir -p "$HOME/.local/bin"
               for b in code-server gcc gfortran cmake ninja clangd clang-format \
-                       gdb git git-lfs jq rg tmux unzip buildctl conda python3; do
+                       gdb git git-lfs jq rg tmux unzip buildctl kubelogin conda python3; do
                 command -v "$b" >/dev/null || { echo "MISSING: $b"; exit 1; }
               done
               [ "$(command -v python3)" = /usr/bin/python3 ] \
                 || { echo "system python3 is shadowed by conda"; exit 1; }
+              # kubectl is deliberately NOT shipped; users self-install it.
+              ! command -v kubectl >/dev/null || { echo "kubectl leaked into the image"; exit 1; }
               [ "${LANG:-}" = en_US.UTF-8 ] || { echo "LANG not set"; exit 1; }
               # The PATH hook must fire in a non-login interactive shell, which
               # is the only kind a code-server terminal ever opens.
