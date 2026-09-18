@@ -32,6 +32,29 @@
   end
 
   gecos = user.gecos.to_s.gsub(/[:\r\n]/, " ").strip
+
+  # ~/.kube/config is OnDemand's own service-account kubeconfig, used by
+  # OnDemand's server-side polling to report this session's status -- not
+  # something a user is meant to edit. The pod runs as the real user (see
+  # "Running as the real user" in the README), so ordinary file permissions
+  # cannot stop the user from overwriting or deleting their own file. Instead
+  # this snapshots whatever is there at submit time and mounts it back
+  # read-only over the same path, the same technique already used for
+  # /etc/passwd and /etc/group below. A ConfigMap volume is immutable from
+  # inside the pod at the kubelet level, not just by permission bits, and
+  # this only shadows that one file -- the rest of ~/.kube/ (a user's own
+  # personal kubeconfig, cache, etc.) is untouched.
+  #
+  # Snapshotting rather than hand-writing the content means this does not
+  # need to know or guess OnDemand's namespace/username naming convention,
+  # and self-corrects if that convention ever changes. Never let a missing
+  # or unreadable file break submission -- a user with no kubeconfig yet
+  # just gets no protection to apply.
+  kube_config_lines = begin
+                         File.readlines(File.join(user.home, ".kube", "config"), chomp: true)
+                       rescue StandardError
+                         []
+                       end
 -%>
 ---
 script:
@@ -325,6 +348,15 @@ script:
             <%- end -%>
           mount_path: "/etc/group"
           sub_path: "group"
+        <%- unless kube_config_lines.empty? -%>
+        - filename: "kubeconfig"
+          data: |
+<%- kube_config_lines.each do |line| -%>
+            <%= line %>
+<%- end -%>
+          mount_path: "<%= user.home %>/.kube/config"
+          sub_path: "kubeconfig"
+        <%- end -%>
     init_containers:
       - name: "init-secret"
         image: "<%= utility_img %>"

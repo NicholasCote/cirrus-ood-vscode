@@ -100,6 +100,37 @@ copied — above 1000 is user and LDAP territory, and not ours to publish into a
 container. The file is read directly rather than through `Etc.group`, which would
 walk all of NSS, LDAP included.
 
+## `~/.kube/config` is pinned read-only
+
+OnDemand keeps its own kubeconfig at `~/.kube/config` on the user's NFS home —
+a non-interactive, service-account-style config (`ood-user-<user>`, a
+`get-cirrus-token.sh` exec plugin) that OnDemand's own server-side status
+polling for this session depends on. It is not meant to be edited.
+
+Because the pod runs as the real user (see "Running as the real user" above),
+ordinary file permissions cannot protect it — the user owns the file and can
+always `chmod`/overwrite/delete their own file regardless of its current mode
+bits. The only thing that actually stops that from inside a container is a
+mount-level override, so `submit.yml.erb` reads whatever is currently at
+`~/.kube/config` at render time and mounts it straight back over the same
+path via the ConfigMap, `sub_path`-scoped exactly like `/etc/passwd` and
+`/etc/group` above. A ConfigMap volume is immutable from inside the pod at
+the kubelet level, not just by permission bits, and mounting it with
+`sub_path` shadows only that one file — the rest of `~/.kube/` (a user's own
+personal kubeconfig, `kubelogin` cache, etc.) is untouched and fully
+writable.
+
+Snapshotting the existing file rather than hand-writing its content means
+this does not need to know or guess OnDemand's namespace/username naming
+convention, and self-corrects if that convention ever changes. If the file
+does not exist yet (a user who has never had one provisioned), the whole
+block is skipped — nothing to protect, and a missing or unreadable file must
+never break submission, the same rule `/etc/group`'s lookup already follows.
+
+This only changes what this pod's own mount namespace sees. It does not
+touch the real file on NFS storage, so it cannot affect however OnDemand's
+own server-side polling reads that same path outside this pod.
+
 ## The image is fixed
 
 There is no image field on the form. Which container VS Code runs in is not a
