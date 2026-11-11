@@ -259,25 +259,29 @@ There are two culls, because there are two different ways a session goes unused:
 The check interval is polling granularity only. Nothing is killed at 5 minutes;
 it just means a cull lands within 5 minutes of its actual threshold.
 
-### Why the heartbeat is not an activity signal
+### Why the first tier counts sockets, not code-server's heartbeat file
 
-code-server exposes a heartbeat file, and it is tempting to read its age as "how
-long the user has been idle." It is not that. Read `out/node/heart.js` on
-4.131.0: `beat()` writes the file at most once per 60s, then arms a 60s timer
-whose callback re-beats **if `server.getConnections()` is non-zero**. So the
-chain sustains itself purely from an open socket, with no user involvement, and
-stops within ~60s of the last connection closing.
+The disconnect cull counts `ESTABLISHED` TCP connections on code-server's port
+(8080) in `/proc/net/tcp` and `/proc/net/tcp6`. The container shares the pod's
+network namespace, so this sees the OnDemand proxy's websockets. Any connection
+at a check resets the disconnect clock.
 
-Heartbeat age therefore measures **time disconnected**, not time idle. Verified
-by holding a socket open and watching the file: once connections hit zero the
-mtime froze and never advanced again.
+**Do not go back to code-server's heartbeat file.** It looks like the obvious
+signal, since `out/node/heart.js` re-beats every 60s while
+`server.getConnections()` is non-zero, but it **does not work on the NFS home**.
+code-server "beats" by writing an empty string to an already-empty file, and on
+NFS truncating a zero-length file does not advance its mtime. The heartbeat
+froze when it was first created, and every session was culled at the first
+check (`no browser connected for 82982s`) with a browser attached. Verified in a
+live pod: two established connections and an unmoving mtime for 5+ minutes; the
+same truncate on local `/tmp` did advance mtime.
 
-That has a consequence worth stating plainly: a tab left open in the foreground
-keeps the heartbeat fresh forever, so heartbeat age alone can never cull it. It
-also means a laptop going to sleep looks exactly like a closed tab — the TCP
-connections die, the heartbeat freezes, and the disconnect clock starts even
-though the tab is still sitting there and will look connected on wake. That is
-the usual explanation for "my session vanished while my browser was still open."
+Either way this measures **time disconnected**, not time idle. A tab left open
+in the foreground holds a socket forever; the CPU tier below handles that. A
+laptop going to sleep looks exactly like a closed tab: the TCP connections die
+and the disconnect clock starts even though the tab will look connected on
+wake. That is the usual explanation for "my session vanished while my browser
+was still open."
 
 ### Why the second tier reads CPU, not the heartbeat
 
@@ -319,14 +323,9 @@ is unaffected.
   code-server, so the script traps it and forwards it — otherwise ending a
   session from the dashboard would leave the editor to be `SIGKILL`ed when the
   grace period expired.
-- **A session nobody ever opens is still reclaimed.** Until the heartbeat file
-  exists the watchdog falls back to the session start time, so a mis-launched
-  session does not live out its full wall time.
-
-The heartbeat path is derived from `$XDG_DATA_HOME`, the way code-server derives
-it — *not* from `--user-data-dir`. Those coincide by default but diverge in the
-unwritable-home fallback above, which repoints `XDG_DATA_HOME`. Confirmed by
-running the image and locating the file code-server actually writes.
+- **A session nobody ever opens is still reclaimed.** The "last connected" clock
+  starts at session launch, so a mis-launched session does not live out its
+  full wall time.
 
 Either cull says which one fired in the session log, since "my session
 disappeared" is otherwise an unanswerable support question:
