@@ -1,0 +1,196 @@
+#!/bin/bash
+
+# vim: set expandtab tabstop=4 shiftwidth=4 :
+
+#MIT LICENSE
+#Copyright 2026 NSF NCAR (Natioonal Science Foundation/ National Center For Atmospheric Research)
+
+# Permission is hereby granted, free of charge, to any person obtaining a copy of this software and 
+# associated documentation files (the “Software”), to deal in the Software without restriction, 
+# including without limitation the rights to use, copy, modify, merge, publish, distribute, sublicense,
+# and/or sell copies of the Software, and to permit persons to whom the Software is furnished to do so, 
+# subject to the following conditions:
+
+# The above copyright notice and this permission notice shall be included in all copies or substantial portions of the Software.
+
+# THE SOFTWARE IS PROVIDED “AS IS”, WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT 
+# LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. 
+# IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY,
+# WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE 
+# SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+
+
+set -euo pipefail
+
+##### Begin static variables - do not changes these #####
+bao_addr=https://openbao.hpc.ucar.edu:8200
+##### End static variables #####
+
+if ( ! which curl > /dev/null ); then
+    echo "Error: curl command not found in your PATH. curl is required for this script."
+    exit 1
+fi 
+
+if ( ! which jq > /dev/null ); then 
+    echo "Error: jq command not found in your PATH. jq is required for this script."
+    exit 1
+fi 
+
+# If SSH_AUTH_SOCK isn't defined, we can't talk to
+# ssh-agent to add the keys
+
+if  [[ -z ${SSH_AUTH_SOCK+x} ]]; then
+    echo 'Error: ssh-agent doesn'\''t seem to be running. The environment'
+    echo 'variable SSH_AUTH_SOCK is not defined in this shell. Please'
+    echo 'check that ssh-agent is running. If it is not, run the command'
+    echo ''\''eval $(ssh-agent)'\'' and then try again.'
+    exit 1
+fi
+
+myuser=$USER
+admin='false'
+
+while getopts ":au:" opt ; do
+    case "$opt" in 
+        a) 
+            admin='true'
+            ;;
+        u)
+            myuser=$OPTARG
+            echo "Using username \"$myuser\" for authentication."
+            ;;
+        \?)
+            echo "Invalid option: -$OPTARG." >&2
+            exit 1
+            ;;
+        :)
+            echo "Option -$OPTARG requires an argument." >&2
+            exit 1
+            ;;
+    esac
+done
+
+echo -n "Password: "
+read -s password
+echo ""
+
+auth_req_data=$(cat << EOF 
+{
+    "password": "$password"
+}
+EOF
+) 
+unset password 
+
+# OpenBao authentication request
+auth_req_result=$(curl -s \
+    --request POST \
+    --data "$auth_req_data" \
+    ${bao_addr}/v1/auth/radius/login/${myuser})
+auth_req_status=$?
+unset auth_req_data
+
+if [[ $auth_req_status -ne 0 ]]; then
+    echo "Error: curl failed with exit code $auth_req_status" >&2
+    exit 1
+fi
+
+client_token=$(echo $auth_req_result | jq -r .auth.client_token)
+if [[ $client_token == "null" ]]; then 
+   echo "Authentication failed. Please try again." >&2
+   exit 1
+fi 
+
+if [[ $admin == 'true' ]]; then
+    valid_principals="$myuser, root"
+    role="admin"
+else
+    valid_principals="$myuser"
+    role="default"
+fi
+
+issue_req_data=$(cat << EOF
+{
+    "valid_principals": "$valid_principals",
+    "cert_type": "user",
+    "key_type": "ed25519"
+}
+EOF
+)
+
+# OpenBao SSH private key/certificate request
+issue_req_result=$(curl -s \
+    --header "X-Vault-Token:$client_token" \
+    --request POST \
+    --data "$issue_req_data"  \
+    ${bao_addr}/v1/ssh-client-signer/issue/$role)
+issue_req_status=$?
+
+if [[ $issue_req_status -ne 0 ]]; then   
+    echo "Error: curl failed with exit code $issue_req_status" >&2
+    exit 1
+fi
+
+# Temp files are needed for ssh-agent. Adding keys w/ certs
+# can't be done just using variables in memory
+#
+umask 077
+tmpdir=$(mktemp -d) 
+trap 'rm -rf $tmpdir' EXIT INT TERM HUP ERR 
+private_key=$tmpdir/openbao.hpc.ucar.edu_key
+cert_file="$private_key-cert.pub"
+
+echo "$issue_req_result" | jq -r .data.private_key  > $private_key
+echo "$issue_req_result" | jq -r .data.signed_key  > $cert_file
+chmod 0600 $private_key $cert_file
+
+# Delete any previous keys from openbao.hpc.ucar.edu
+# Probably not necessary, but I don't want users to 
+# endup with dozens of expired keys/certs in their 
+# agents memory. 
+#
+# For most modern OpenSSH versions, this approach of 
+# ssh-add taking input from STDIN will work, but for RHEL 8, 
+# it doesn't work, and it fails silently. For max compatibility
+# and less user support, I switched from this approach to 
+# using temp files instead, which should work everwhere. I'm
+# leaving this code here but commented out for when someone 
+# looks at this code and asks "Why didn't you just...?" 
+#
+#IFS=$'\n'
+#for key in $(ssh-add -L  | grep 'openbao.hpc.ucar.edu_key'  | awk '{ print $1" "$2  }'); do 
+#        echo "$key" | ssh-add -q -d -  >/dev/null
+#done
+#unset IFS
+ 
+IFS=$'\n'
+for key in $(ssh-add -L  | grep 'openbao.hpc.ucar.edu_key'  | awk '{ print $1" "$2  }'); do
+    tmpfile=$(mktemp -p $tmpdir)
+    echo "$key" >$tmpfile
+    ssh-add -q -d $tmpfile
+    rm $tmpfile
+done
+unset IFS
+
+# Using "-C " with ssh-add is a problem. Not all ssh-agents
+# currently out there support the -C option (stargate4 as 
+# of this writing, for example). Also, using -C option always
+# results an error stating the key itself couldn't be added, 
+# which is kinda stupid, when you think about it. So I'm not 
+# using "ssh-add -C" here.
+ 
+ssh-add -q $private_key  >/dev/null 
+ssh_add_status=$?
+if [[ $ssh_add_status -eq 1 ]]; then 
+    echo "Error: ssh-add operation failed"
+    rm -rf $tmpdir
+    exit 1 
+elif [[ $ssh_add_status -eq 2 ]]; then 
+    echo "Error: ssh-add was unable to contact ssh-agent"
+    rm -rf $tmpdir
+    exit 1 
+fi 
+
+rm -rf $tmpdir
+
+exit 0

@@ -166,7 +166,7 @@ script:
             WORKDIR="${CODE_SERVER_WORKDIR:-$HOME}"
             if [ ! -d "$WORKDIR" ]; then
               echo "launch.sh: '$WORKDIR' is not a directory in this session;" >&2
-              echo "  opening $HOME instead. Only your home directory is mounted." >&2
+              echo "  opening $HOME instead. Only home and the /glade mounts exist here." >&2
               WORKDIR="$HOME"
             fi
             cd "$WORKDIR" || cd "$HOME" || exit 1
@@ -192,7 +192,27 @@ script:
               mkdir -p "$XDG_DATA_HOME" "$XDG_CONFIG_HOME" "$XDG_CACHE_HOME" || exit 1
             fi
 
-            echo "launch.sh: code-server=${CS} workdir=${WORKDIR} data=${DATA_DIR}"
+            # One ssh-agent for the whole session, so `bao-getkey` (in the image)
+            # has somewhere to load its signed OpenBao certificate and every
+            # terminal's ssh to Casper/Derecho can use it without the
+            # ncar-two-factor prompt. Exported before code-server starts, which
+            # is how terminals inherit it -- they are non-login shells and
+            # nothing else would set it. The socket is on container-local /tmp,
+            # never the NFS home: it must not outlive the pod or be shared
+            # between concurrent sessions. A missing ssh-agent is a warning, not
+            # a failed launch.
+            if command -v ssh-agent >/dev/null 2>&1; then
+              SSH_AUTH_SOCK="/tmp/ssh-agent-$(id -u).sock"
+              rm -f "$SSH_AUTH_SOCK"
+              if ssh-agent -a "$SSH_AUTH_SOCK" >/dev/null; then
+                export SSH_AUTH_SOCK
+              else
+                echo "launch.sh: WARNING ssh-agent failed to start; bao-getkey will not work in this session." >&2
+                unset SSH_AUTH_SOCK
+              fi
+            fi
+
+            echo "launch.sh: code-server=${CS} workdir=${WORKDIR} data=${DATA_DIR} ssh_auth_sock=${SSH_AUTH_SOCK:-none}"
 
             # "Is a browser connected?" is answered by counting ESTABLISHED TCP
             # connections on code-server's port, NOT by code-server's heartbeat

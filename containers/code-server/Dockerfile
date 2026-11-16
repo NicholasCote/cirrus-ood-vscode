@@ -161,4 +161,21 @@ RUN set -eux; \
     chmod 0755 /usr/local/bin/kubelogin; \
     rm -f /tmp/kubelogin.zip
 
+# --- bao-getkey -------------------------------------------------------------
+# HSG's OpenBao client (NCAR/hsg-openbao-scripts, MIT). One password+Duo
+# login mints a short-lived signed SSH certificate and loads it into
+# ssh-agent, so ssh to Casper/Derecho stops prompting for ncar-two-factor on
+# every connection. Needs only curl, jq, and ssh-add, all installed above.
+#
+# Vendored rather than fetched: the upstream repo is `internal` to the NCAR
+# org, so an unauthenticated build cannot download it. Copied verbatim from
+# commit ef6b7a7503c911977865df50df3b4d4fc223c25b (2026-11-11); update by
+# re-copying bin/bao-getkey from upstream.
+#
+# The agent it talks to is started by launch.sh in submit.yml.erb, which
+# exports SSH_AUTH_SOCK to code-server and therefore to every terminal.
+# Plain COPY + chmod rather than COPY --chmod, which older buildah lacks.
+COPY bao-getkey /usr/local/bin/bao-getkey
+RUN chmod 0755 /usr/local/bin/bao-getkey
+
 USER 1000

@@ -138,31 +138,27 @@ decision a user opening an editor should have to make, and getting it wrong
 produces a session that dies on startup — code-server is a separate install, so
 most images, including nearly every Jupyter image, simply do not have it.
 
-The app runs upstream's own image, pinned:
+The app runs our own image, built from `containers/code-server/Dockerfile`:
 
 ```
-docker.io/codercom/code-server:4.131.0
+hub.k8s.ucar.edu/cirrus-ood/code-server:<code-server version>-<build date>
 ```
 
-A blank slate — Debian 13, glibc 2.41, `code-server` at `/usr/bin/code-server`,
-plus `bash`, `git`, `curl`, and `nano`. Deliberately **no** Python, compilers, or
-scientific stack: users bring their own toolchain from their home directory,
-which is mounted. If a session needs a preinstalled environment instead, change
-the `editor_img` constant at the top of `submit.yml.erb` — that is the single
-point of control, and the only requirement on a replacement is a `code-server`
-executable and a POSIX shell.
+It is upstream `codercom/code-server` (Debian 13) plus what a user cannot
+install into their own home without root: compilers (`gcc`, `gfortran`,
+`cmake`, `ninja`), `clangd`, `gdb`, system Python, Miniforge at `/opt/conda`,
+`buildctl`, `kubelogin`, and `bao-getkey`. The Dockerfile header states that
+inclusion rule and documents each exception to it.
 
-Pinned to an explicit version rather than `:latest` so a session that worked
-yesterday works today.
+**Do not hand-edit `editor_img`.** `.github/workflows/build-code-server.yml`
+builds the image on every push touching `containers/code-server/`,
+smoke-tests it as an arbitrary UID, pushes it to Harbor, and commits the new
+tag back into `submit.yml.erb`. Tags are dated rather than `:latest`, so a
+session that worked yesterday works today and a bad build rolls back by
+reverting one line.
 
-The reference is left pointing at `docker.io` deliberately. `hub.k8s.ucar.edu`
-proxies external registries, so the cluster pulls this through Harbor and caches
-it — the first pull of a new tag is slow, and every one after it is fast and
-served locally. Nothing has to be mirrored by hand and the reference does not
-need rewriting into a `hub.k8s.ucar.edu` path, which would only bake a detail of
-the registry layout into the app. The practical consequence is that **bumping the
-version makes the next launch slow exactly once**, which is worth knowing before
-doing it in front of someone.
+A new tag is pulled cold on first use, so **the first launch after a bump is
+slow**, which is worth knowing before doing it in front of someone.
 
 `launch.sh` still probes `/usr/bin`, `/usr/local/bin`,
 `/usr/lib/code-server/bin`, `/opt/code-server/bin`, `$HOME/.local/bin`, and
@@ -194,9 +190,9 @@ manifests differ by exactly the two `nvidia.com/gpu` lines and nothing else.
 
 ### The image has no CUDA toolkit
 
-Requesting a GPU does not make the editor image able to use one. The pinned image
-is a blank slate, so **bring your own GPU-enabled environment from your home
-directory.** That works better than it sounds: the node's device plugin injects
+Requesting a GPU does not make the editor image able to use one. The image
+carries compilers but no CUDA toolkit, so **bring your own GPU-enabled
+environment from your home directory.** That works better than it sounds: the node's device plugin injects
 the driver and `nvidia-smi`, and conda- or pip-installed PyTorch and TensorFlow
 wheels bundle their own CUDA runtime, so they need only the driver. `nvidia-smi`
 will see the card regardless of what is installed.
@@ -363,6 +359,11 @@ metadata:
 for it — enforced if so, inert if not. The reaper matches pods carrying a `job`
 label, which ood_core already stamps on every pod.
 
+As of November 2026 the reaper does **not** appear to be active on Cirrus, so this
+ceiling is not enforced there. In practice the two idle culls have been doing the
+work: sessions end on their own and the per-user namespace does not accumulate
+pods.
+
 This used to be a **Wall time (hours)** form field, and it was asking users to
 answer an HPC scheduling question that does not apply here: Kubernetes has no job
 time limit, OnDemand never displays the value (the adapter reports elapsed
@@ -372,6 +373,41 @@ at all. Fixing it in the template keeps the backstop and drops the question.
 Do not let it fall back to the form. The field is gone, so a `wall_time.to_i`
 would be `0` and render a `00h00m00s` lifetime — which a reaper would honour
 instantly, killing every session the moment it started.
+
+## SSH to Casper/Derecho without the MFA prompt
+
+Every `ssh casper.hpc.ucar.edu` from a terminal would otherwise stop at
+`ncar-two-factor:`. The image ships HSG's
+[`bao-getkey`](https://github.com/NCAR/hsg-openbao-scripts), which trades one
+password+Duo login for a short-lived signed SSH certificate from OpenBao and
+loads it into ssh-agent. After that, ssh to the HSG systems uses the
+certificate and does not ask again until it expires:
+
+```bash
+bao-getkey          # password + Duo, once
+ssh casper.hpc.ucar.edu
+```
+
+When ssh starts prompting again, the certificate has expired. Run `bao-getkey`
+again.
+
+Two pieces make this work:
+
+- **The script is vendored**, at `containers/code-server/bao-getkey`. The
+  upstream repo is `internal` to the NCAR org, so a CI build cannot download it
+  without a token. It is a verbatim copy of `bin/bao-getkey` at a pinned commit
+  (recorded in the Dockerfile). To update it, copy that file again.
+- **`launch.sh` starts one ssh-agent per session** and exports `SSH_AUTH_SOCK`
+  before code-server starts. Every terminal inherits it from there, since nothing
+  else sets it (terminals are non-login shells). The socket lives on
+  container-local `/tmp`, not on the NFS home, so it ends with the pod and
+  concurrent sessions never share one. The key exists only in agent memory and
+  is never written to `~/.ssh`.
+
+If a user's `~/.bashrc` starts its own `ssh-agent`, that agent overwrites
+`SSH_AUTH_SOCK` in each new terminal, and a certificate loaded in one terminal
+is invisible in the next. The fix is in their dotfiles: start an agent only when
+`SSH_AUTH_SOCK` is unset.
 
 ## Logging
 
@@ -441,6 +477,8 @@ inside a block scalar and quoting is free.
 | `view.html.erb` | Connect button; posts the session password to `/rnode/.../login` |
 | `info.md.erb` | Session card body; flags a GPU session |
 | `template/` | `batch_connect` template directory |
+| `containers/code-server/Dockerfile` | The editor image (built and tag-bumped by CI) |
+| `containers/code-server/bao-getkey` | Vendored OpenBao SSH-certificate client, installed into the image |
 
 ## Deploy as a dev app
 
@@ -462,7 +500,8 @@ driver, not the CUDA toolkit.
 
 ## Not yet done
 
-- Only the home directory is mounted, matching the Jupyter apps.
+- The ssh to Casper/Derecho has not been confirmed from a live session with a
+  real `bao-getkey` certificate.
 
 ## What was verified locally
 

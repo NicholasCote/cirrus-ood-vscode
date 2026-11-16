@@ -14,8 +14,8 @@ attributes:
     value: ""
     help: |
       Absolute path to the folder VS Code opens. Leave blank for your home
-      directory. Only your home directory is mounted into the session, so this
-      should be a path underneath it.
+      directory. Your home, /glade/work, /glade/campaign, /glade/collections and
+      /gdex are mounted into the session, so it should be a path under one of those.
     required: false
   cpu:
     widget: number_field
@@ -52,7 +52,7 @@ attributes:
       Check the box to request one NVIDIA GPU (`nvidia.com/gpu`); leave it clear
       for a CPU-only session.
 
-      The editor image is a blank slate and ships no CUDA toolkit, so bring your
+      The editor image ships no CUDA toolkit, so bring your
       own GPU-enabled environment from your home directory. A conda or pip
       install of PyTorch or TensorFlow works — those wheels bundle their own CUDA
       runtime and only need the driver, which the node injects. `nvidia-smi` is
