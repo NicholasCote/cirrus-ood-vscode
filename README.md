@@ -450,6 +450,13 @@ pattern and rejected with an explanatory error before it reaches any YAML. The
 same applies to GECOS, which is free text from the site user database and would
 otherwise be able to inject an `/etc/passwd` line.
 
+CPUs and memory are number fields, but the form's min/max are enforced only by
+the browser, so a hand-edited submission could send anything. They are checked
+as whole numbers in range (1-8 CPUs, 1-32 GB) before use. Unchecked, a value
+like `2"` followed by a newline could add keys to the container spec: replace
+the image, or add `supplemental_groups` (which ood_core passes straight into
+the pod's securityContext).
+
 The same constraint binds anything *this app* writes into a `command:` array,
 not just user input. ood_core re-emits each element as `- "<element>"`, so a
 literal double quote in a command closes the YAML string early and the whole

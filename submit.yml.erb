@@ -2,6 +2,19 @@
   utility_img = "docker.io/ohiosupercomputer/ood-k8s-utils:latest"
   user = OodSupport::User.new
 
+  # Validated here, not just by the form's min/max: the browser's limits are
+  # advisory, and these values are pasted into the pod spec's YAML, where a
+  # crafted value could add keys (another image, extra supplemental groups).
+  whole_number = lambda do |label, raw, range|
+    s = raw.to_s.strip
+    unless s.match?(/\A\d{1,3}\z/) && range.cover?(s.to_i)
+      raise "#{label} must be a whole number from #{range.min} to #{range.max}, got #{raw.to_s.inspect}."
+    end
+    s.to_i
+  end
+  cpus = whole_number.call("CPUs", cpu, 1..8)
+  memory_gb = whole_number.call("Memory (GB)", memory, 1..32)
+
   # Two separate culls. See the "Idle culling" section of the README.
   connected_idle_timeout = 28800  # idle user time with a connected browser
   disconnect_timeout     = 14400  # idle time once the browser session is disconnected
@@ -78,8 +91,8 @@ script:
         # here so the image itself carries none.
         BUILDKIT_HOST: "tcp://buildkitd.arc-systems.svc:1234"
       port: 8080
-      cpu: "<%= cpu %>"
-      memory: "<%= memory %>Gi"
+      cpu: "<%= cpus %>"
+      memory: "<%= memory_gb %>Gi"
       startup_probe:
         initial_delay_seconds: 5
         failure_threshold: 60
