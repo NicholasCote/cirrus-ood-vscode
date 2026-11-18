@@ -178,4 +178,56 @@ RUN set -eux; \
 COPY bao-getkey /usr/local/bin/bao-getkey
 RUN chmod 0755 /usr/local/bin/bao-getkey
 
+# --- AI assistant extensions (Claude Code, Cline) + claude CLI ---------------
+# Installed as code-server BUILT-IN extensions, not with --install-extension.
+# --install-extension writes to --extensions-dir, which launch.sh points at the
+# user's NFS home; anything in lib/vscode/extensions instead loads from the
+# image for everyone and never touches $HOME. Built-ins show up under
+# "Built-in" in the Extensions view with a Disable button (no Uninstall), and
+# that per-user choice persists in the user's own settings across sessions.
+#
+# Trade-off: built-ins never auto-update. They move only when these pins are
+# bumped and the image is rebuilt. Versions come from Open VSX:
+#   curl -s https://open-vsx.org/api/anthropic/claude-code | jq -r .version
+#   curl -s https://open-vsx.org/api/saoudrizwan/claude-dev | jq -r .version
+#
+# Claude Code's VSIX is per-platform (linux-x64 / linux-arm64) because it
+# bundles the native `claude` binary (~370MB). /usr/local/bin/claude is a
+# symlink to that same binary rather than a second download, so the terminal
+# CLI and the extension can never drift apart in version.
+#
+# DISABLE_AUTOUPDATER is load-bearing: the binary is root-owned and read-only,
+# so the CLI's self-updater would otherwise "update" by installing a fresh copy
+# under ~/.local/share/claude -- exactly the install-into-home this avoids.
+# (~/.claude still holds each user's own settings and history; that is runtime
+# state, like ~/.local/share/code-server, not an install.)
+#
+# No model endpoint or key is configured here: that is site/user config and
+# belongs in submit.yml.erb / the user's environment, not in a pullable image.
+ARG CLAUDE_CODE_EXT_VERSION=2.1.327
+ARG CLINE_EXT_VERSION=4.1.26
+RUN set -eux; \
+    builtin=/usr/lib/code-server/lib/vscode/extensions; \
+    test -d "$builtin"; \
+    case "$(dpkg --print-architecture)" in \
+      amd64) vsx_target=linux-x64 ;; \
+      arm64) vsx_target=linux-arm64 ;; \
+      *) echo "no Claude Code VSIX for this arch" >&2; exit 1 ;; \
+    esac; \
+    curl -fsSLo /tmp/claude-code.vsix \
+      "https://open-vsx.org/api/Anthropic/claude-code/${vsx_target}/${CLAUDE_CODE_EXT_VERSION}/file/Anthropic.claude-code-${CLAUDE_CODE_EXT_VERSION}@${vsx_target}.vsix"; \
+    curl -fsSLo /tmp/cline.vsix \
+      "https://open-vsx.org/api/saoudrizwan/claude-dev/${CLINE_EXT_VERSION}/file/saoudrizwan.claude-dev-${CLINE_EXT_VERSION}.vsix"; \
+    for pair in anthropic.claude-code:claude-code saoudrizwan.claude-dev:cline; do \
+      id="${pair%%:*}"; vsix="/tmp/${pair##*:}.vsix"; \
+      rm -rf "/tmp/${id}"; \
+      unzip -q "$vsix" 'extension/*' -d "/tmp/${id}"; \
+      mv "/tmp/${id}/extension" "${builtin}/${id}"; \
+      rm -rf "/tmp/${id}" "$vsix"; \
+      chmod -R a+rX "${builtin}/${id}"; \
+    done; \
+    ln -sf "${builtin}/anthropic.claude-code/resources/native-binary/claude" /usr/local/bin/claude; \
+    /usr/local/bin/claude --version
+ENV DISABLE_AUTOUPDATER=1
+
 USER 1000
